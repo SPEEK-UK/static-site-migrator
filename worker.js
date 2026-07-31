@@ -1,4 +1,4 @@
-const VERSION = "1.5.0";
+const VERSION = "1.6.0";
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -36,9 +36,11 @@ export default {
         );
       }
 
-      let match = pathname.match(/^\/api\/migrations\/([^/]+)\/rewrite-pages$/);
+      let match = pathname.match(
+        /^\/api\/migrations\/([^/]+)\/stabilise-static$/
+      );
       if (request.method === "POST" && match) {
-        return await rewritePages(decodeURIComponent(match[1]), env);
+        return await stabiliseStaticSite(decodeURIComponent(match[1]), env);
       }
 
       match = pathname.match(/^\/api\/migrations\/([^/]+)$/);
@@ -54,15 +56,394 @@ export default {
   },
 };
 
-async function servePreview(jobId, requestedPath, env) {
-  const job = await env.DB
-    .prepare("SELECT * FROM migration_jobs WHERE id = ?")
-    .bind(jobId)
-    .first();
-
+async function stabiliseStaticSite(jobId, env) {
+  const job = await getJob(jobId, env);
   if (!job) {
-    return new Response("Preview job not found.", { status: 404 });
+    return json({ success: false, error: "Migration job not found." }, 404);
   }
+
+  const pagesResult = await env.DB
+    .prepare(`
+      SELECT id, source_url, output_path
+      FROM migration_pages
+      WHERE job_id = ? AND status = 'captured'
+      ORDER BY source_url
+    `)
+    .bind(jobId)
+    .all();
+
+  const pages = pagesResult.results || [];
+  if (!pages.length) {
+    return json({ success: false, error: "No captured pages are available." }, 409);
+  }
+
+  const startedAt = now();
+  await env.DB.batch([
+    env.DB
+      .prepare(`
+        UPDATE migration_jobs
+        SET status = ?, current_stage = ?, progress_percent = ?, updated_at = ?
+        WHERE id = ?
+      `)
+      .bind("processing", "stabilising_static_site", 86, startedAt, jobId),
+    eventStatement(
+      env,
+      jobId,
+      "info",
+      "stabilising_static_site",
+      "Static animation and widget stabilisation started.",
+      { pages: pages.length },
+      startedAt
+    ),
+  ]);
+
+  const results = [];
+  const warnings = [];
+  let totalAnimatedElements = 0;
+  let totalCarouselWidgets = 0;
+  let totalSlidesRecovered = 0;
+
+  for (const page of pages) {
+    const outputPath = page.output_path || "index.html";
+    const key = `${job.output_prefix}/site/${outputPath}`;
+
+    try {
+      const object = await env.STORAGE.get(key);
+      if (!object || !object.body) {
+        throw new Error(`Generated page is missing from R2: ${key}`);
+      }
+
+      const originalHtml = await object.text();
+      const result = stabiliseHtml(originalHtml);
+
+      await env.STORAGE.put(key, result.html, {
+        httpMetadata: { contentType: "text/html; charset=utf-8" },
+        customMetadata: {
+          jobId,
+          pageId: page.id,
+          sourceUrl: page.source_url,
+          stabilised: "true",
+          stabiliserVersion: VERSION,
+        },
+      });
+
+      totalAnimatedElements += result.animatedElements;
+      totalCarouselWidgets += result.carouselWidgets;
+      totalSlidesRecovered += result.slidesRecovered;
+
+      results.push({
+        pageId: page.id,
+        sourceUrl: page.source_url,
+        outputPath,
+        r2Key: key,
+        animatedElementsStabilised: result.animatedElements,
+        carouselWidgetsStabilised: result.carouselWidgets,
+        slidesRecovered: result.slidesRecovered,
+        injectedFallbackStyles: result.injectedFallbackStyles,
+        htmlLength: result.html.length,
+      });
+    } catch (error) {
+      warnings.push({
+        pageId: page.id,
+        sourceUrl: page.source_url,
+        error: errorMessage(error),
+      });
+    }
+  }
+
+  const report = {
+    version: VERSION,
+    jobId,
+    generatedAt: now(),
+    pagesExpected: pages.length,
+    pagesStabilised: results.length,
+    animationsFlattened: totalAnimatedElements,
+    carouselWidgetsStabilised: totalCarouselWidgets,
+    slidesRecovered: totalSlidesRecovered,
+    warnings,
+    deploymentReady: warnings.length === 0,
+  };
+
+  const reportKey = `${job.output_prefix}/site/migration-quality-report.json`;
+  await env.STORAGE.put(reportKey, JSON.stringify(report, null, 2), {
+    httpMetadata: { contentType: "application/json; charset=utf-8" },
+    customMetadata: { jobId, generatedBy: `static-site-migrator-${VERSION}` },
+  });
+
+  const completedAt = now();
+  const stage = warnings.length
+    ? "static_stabilised_with_warnings"
+    : "static_stabilised";
+  const progress = warnings.length ? 88 : 90;
+
+  await env.DB.batch([
+    env.DB
+      .prepare(`
+        UPDATE migration_jobs
+        SET status = ?, current_stage = ?, progress_percent = ?,
+            warning_count = warning_count + ?, updated_at = ?
+        WHERE id = ?
+      `)
+      .bind(
+        "processing",
+        stage,
+        progress,
+        warnings.length,
+        completedAt,
+        jobId
+      ),
+    eventStatement(
+      env,
+      jobId,
+      warnings.length ? "warning" : "info",
+      stage,
+      warnings.length
+        ? "Static stabilisation completed with warnings."
+        : "Static animations and carousel widgets were stabilised.",
+      {
+        pagesStabilised: results.length,
+        animationsFlattened: totalAnimatedElements,
+        carouselWidgetsStabilised: totalCarouselWidgets,
+        slidesRecovered: totalSlidesRecovered,
+        reportKey,
+      },
+      completedAt
+    ),
+  ]);
+
+  return json({
+    success: warnings.length === 0,
+    jobId,
+    status: "processing",
+    currentStage: stage,
+    progressPercent: progress,
+    pagesStabilised: results.length,
+    animationsFlattened: totalAnimatedElements,
+    carouselWidgetsStabilised: totalCarouselWidgets,
+    slidesRecovered: totalSlidesRecovered,
+    reportKey,
+    pages: results,
+    warnings,
+  });
+}
+
+function stabiliseHtml(html) {
+  let output = html;
+  let animatedElements = 0;
+  let carouselWidgets = 0;
+  let slidesRecovered = 0;
+  let injectedFallbackStyles = false;
+
+  output = output.replace(
+    /style\s*=\s*(["'])(.*?)\1/gi,
+    (match, quote, styleText) => {
+      const result = stabiliseInlineStyle(styleText);
+      if (!result.changed) return match;
+      animatedElements += 1;
+      return `style=${quote}${result.style}${quote}`;
+    }
+  );
+
+  output = output.replace(
+    /class\s*=\s*(["'])(.*?)\1/gi,
+    (match, quote, classes) => {
+      const cleaned = classes
+        .split(/\s+/)
+        .filter(Boolean)
+        .filter(
+          (name) =>
+            !/^(?:wow|animated|skrollable|skrollr-before|skrollr-after|dm-animation-|invisible|opacity-0)$/i.test(
+              name
+            )
+        )
+        .join(" ");
+      return `class=${quote}${cleaned}${quote}`;
+    }
+  );
+
+  const carouselClassPattern =
+    /<(div|section)\b([^>]*class=["'][^"']*(?:dmWidgetCarousel|dmImageSlider|gallery|carousel|slider|slick-slider|swiper-container)[^"']*["'][^>]*)>([\s\S]*?)<\/\1>/gi;
+
+  output = output.replace(
+    carouselClassPattern,
+    (whole, tagName, attributes, inner) => {
+      const imageMatches = [
+        ...inner.matchAll(
+          /<img\b[^>]*(?:src|data-src)\s*=\s*(["'])(.*?)\1[^>]*>/gi
+        ),
+      ];
+
+      const uniqueImages = [];
+      const seen = new Set();
+      for (const imageMatch of imageMatches) {
+        const src = imageMatch[2];
+        if (!src || seen.has(src)) continue;
+        seen.add(src);
+        uniqueImages.push(imageMatch[0]);
+      }
+
+      if (!uniqueImages.length) return whole;
+
+      carouselWidgets += 1;
+      slidesRecovered += uniqueImages.length;
+
+      const slides = uniqueImages
+        .map(
+          (image, index) =>
+            `<div class="ssm-static-slide" data-static-slide="${index + 1}">${forceVisibleImage(image)}</div>`
+        )
+        .join("");
+
+      return `<${tagName}${attributes} data-ssm-static-carousel="true"><div class="ssm-static-carousel">${slides}</div></${tagName}>`;
+    }
+  );
+
+  const fallbackCss = `
+<style id="ssm-static-stabilisation">
+html body [style*="opacity: 0"],
+html body [style*="opacity:0"] {
+  opacity: 1 !important;
+}
+html body [style*="translate"],
+html body .skrollable,
+html body .skrollr-before,
+html body .skrollr-after,
+html body [class*="dm-animation-"] {
+  opacity: 1 !important;
+  transform: none !important;
+  translate: none !important;
+  animation: none !important;
+  transition: none !important;
+  visibility: visible !important;
+}
+html body [data-ssm-static-carousel="true"] {
+  overflow: visible !important;
+  height: auto !important;
+  min-height: 1px !important;
+  opacity: 1 !important;
+  visibility: visible !important;
+}
+html body .ssm-static-carousel {
+  display: grid !important;
+  grid-template-columns: repeat(auto-fit, minmax(min(260px, 100%), 1fr));
+  gap: 16px;
+  width: 100%;
+  height: auto !important;
+  opacity: 1 !important;
+  visibility: visible !important;
+  transform: none !important;
+}
+html body .ssm-static-slide {
+  display: block !important;
+  position: relative !important;
+  inset: auto !important;
+  width: 100% !important;
+  height: auto !important;
+  opacity: 1 !important;
+  visibility: visible !important;
+  transform: none !important;
+}
+html body .ssm-static-slide img {
+  display: block !important;
+  width: 100% !important;
+  max-width: 100% !important;
+  height: auto !important;
+  opacity: 1 !important;
+  visibility: visible !important;
+  transform: none !important;
+}
+</style>`;
+
+  if (!output.includes('id="ssm-static-stabilisation"')) {
+    if (/<\/head>/i.test(output)) {
+      output = output.replace(/<\/head>/i, `${fallbackCss}\n</head>`);
+    } else {
+      output = `${fallbackCss}\n${output}`;
+    }
+    injectedFallbackStyles = true;
+  }
+
+  return {
+    html: output,
+    animatedElements,
+    carouselWidgets,
+    slidesRecovered,
+    injectedFallbackStyles,
+  };
+}
+
+function stabiliseInlineStyle(styleText) {
+  const declarations = styleText
+    .split(";")
+    .map((item) => item.trim())
+    .filter(Boolean);
+
+  let changed = false;
+  const retained = [];
+
+  for (const declaration of declarations) {
+    const separator = declaration.indexOf(":");
+    if (separator < 0) {
+      retained.push(declaration);
+      continue;
+    }
+
+    const property = declaration.slice(0, separator).trim().toLowerCase();
+    const value = declaration.slice(separator + 1).trim();
+
+    if (property === "opacity" && /^0(?:\.0+)?(?:\s*!important)?$/i.test(value)) {
+      retained.push("opacity: 1 !important");
+      changed = true;
+      continue;
+    }
+
+    if (
+      ["transform", "translate", "animation", "animation-name"].includes(property) &&
+      /(translate|matrix|scale|rotate|slide|fade|skroll|animation)/i.test(value)
+    ) {
+      retained.push(
+        property === "animation" || property === "animation-name"
+          ? `${property}: none !important`
+          : `${property}: none !important`
+      );
+      changed = true;
+      continue;
+    }
+
+    if (property === "visibility" && /hidden/i.test(value)) {
+      retained.push("visibility: visible !important");
+      changed = true;
+      continue;
+    }
+
+    retained.push(`${property}: ${value}`);
+  }
+
+  return { style: retained.join("; "), changed };
+}
+
+function forceVisibleImage(imageHtml) {
+  let output = imageHtml;
+
+  if (/\bstyle\s*=\s*(["'])/i.test(output)) {
+    output = output.replace(
+      /\bstyle\s*=\s*(["'])(.*?)\1/i,
+      (_, quote, style) =>
+        `style=${quote}${style}; opacity:1 !important; visibility:visible !important; transform:none !important; display:block !important;${quote}`
+    );
+  } else {
+    output = output.replace(
+      /<img\b/i,
+      '<img style="opacity:1 !important; visibility:visible !important; transform:none !important; display:block !important;"'
+    );
+  }
+
+  return output;
+}
+
+async function servePreview(jobId, requestedPath, env) {
+  const job = await getJob(jobId, env);
+  if (!job) return new Response("Preview job not found.", { status: 404 });
 
   let relativePath;
   try {
@@ -88,8 +469,7 @@ async function servePreview(jobId, requestedPath, env) {
   let resolvedPath = null;
 
   for (const candidate of candidates) {
-    const key = `${job.output_prefix}/site/${candidate}`;
-    object = await env.STORAGE.get(key);
+    object = await env.STORAGE.get(`${job.output_prefix}/site/${candidate}`);
     if (object && object.body) {
       resolvedPath = candidate;
       break;
@@ -100,27 +480,27 @@ async function servePreview(jobId, requestedPath, env) {
     return new Response("Preview file not found.", { status: 404 });
   }
 
-  const contentType =
-    object.httpMetadata?.contentType || guessContentType(resolvedPath);
-
+  const contentType = object.httpMetadata?.contentType || guessContentType(resolvedPath);
   const headers = new Headers({
     "Content-Type": contentType,
     "Cache-Control": "no-store, max-age=0",
     "X-Robots-Tag": "noindex, nofollow",
   });
 
-  const previewPrefix = `/preview/${encodeURIComponent(jobId)}`;
+  const prefix = `/preview/${encodeURIComponent(jobId)}`;
 
   if (/text\/html/i.test(contentType)) {
-    let html = await object.text();
-    html = prefixPreviewHtmlUrls(html, previewPrefix);
-    return new Response(html, { status: 200, headers });
+    return new Response(prefixPreviewHtmlUrls(await object.text(), prefix), {
+      status: 200,
+      headers,
+    });
   }
 
   if (/text\/css/i.test(contentType)) {
-    let css = await object.text();
-    css = prefixPreviewCssUrls(css, previewPrefix);
-    return new Response(css, { status: 200, headers });
+    return new Response(prefixPreviewCssUrls(await object.text(), prefix), {
+      status: 200,
+      headers,
+    });
   }
 
   return new Response(object.body, { status: 200, headers });
@@ -129,8 +509,7 @@ async function servePreview(jobId, requestedPath, env) {
 function prefixPreviewHtmlUrls(html, prefix) {
   let output = html.replace(
     /\b(href|src|poster|data-src|data-image-url)\s*=\s*(["'])\/(?!\/|preview\/)(.*?)\2/gi,
-    (_, attribute, quote, value) =>
-      `${attribute}=${quote}${prefix}/${value}${quote}`
+    (_, attribute, quote, value) => `${attribute}=${quote}${prefix}/${value}${quote}`
   );
 
   output = output.replace(
@@ -140,7 +519,11 @@ function prefixPreviewHtmlUrls(html, prefix) {
         .split(",")
         .map((candidate) => {
           const parts = candidate.trim().split(/\s+/);
-          if (parts[0]?.startsWith("/") && !parts[0].startsWith("//") && !parts[0].startsWith("/preview/")) {
+          if (
+            parts[0]?.startsWith("/") &&
+            !parts[0].startsWith("//") &&
+            !parts[0].startsWith("/preview/")
+          ) {
             parts[0] = `${prefix}${parts[0]}`;
           }
           return parts.join(" ");
@@ -150,8 +533,7 @@ function prefixPreviewHtmlUrls(html, prefix) {
     }
   );
 
-  output = prefixPreviewCssUrls(output, prefix);
-  return output;
+  return prefixPreviewCssUrls(output, prefix);
 }
 
 function prefixPreviewCssUrls(value, prefix) {
@@ -162,11 +544,7 @@ function prefixPreviewCssUrls(value, prefix) {
 }
 
 async function getMigration(jobId, env) {
-  const job = await env.DB
-    .prepare("SELECT * FROM migration_jobs WHERE id = ?")
-    .bind(jobId)
-    .first();
-
+  const job = await getJob(jobId, env);
   if (!job) {
     return json({ success: false, error: "Migration job not found." }, 404);
   }
@@ -199,420 +577,11 @@ async function getMigration(jobId, env) {
   });
 }
 
-async function rewritePages(jobId, env) {
-  const job = await env.DB
+async function getJob(jobId, env) {
+  return env.DB
     .prepare("SELECT * FROM migration_jobs WHERE id = ?")
     .bind(jobId)
     .first();
-
-  if (!job) {
-    return json({ success: false, error: "Migration job not found." }, 404);
-  }
-
-  const [pagesResult, assetsResult] = await Promise.all([
-    env.DB
-      .prepare(`
-        SELECT * FROM migration_pages
-        WHERE job_id = ? AND status = 'captured' AND html_r2_key IS NOT NULL
-        ORDER BY source_url
-      `)
-      .bind(jobId)
-      .all(),
-    env.DB
-      .prepare(`
-        SELECT * FROM migration_assets
-        WHERE job_id = ?
-        ORDER BY source_url
-      `)
-      .bind(jobId)
-      .all(),
-  ]);
-
-  const pages = pagesResult.results || [];
-  const assets = assetsResult.results || [];
-
-  if (!pages.length) {
-    return json({ success: false, error: "No captured pages are available." }, 409);
-  }
-
-  const downloadedAssets = assets.filter(
-    (asset) => asset.status === "downloaded" && asset.output_path && asset.r2_key
-  );
-  const blockedAssets = assets.filter((asset) => asset.status === "blocked");
-
-  const assetMap = new Map();
-  for (const asset of downloadedAssets) {
-    assetMap.set(normaliseUrl(asset.source_url), `/${asset.output_path}`);
-  }
-
-  const pageMap = new Map();
-  for (const page of pages) {
-    pageMap.set(
-      normaliseComparableUrl(page.source_url),
-      outputPathToPublicUrl(page.output_path)
-    );
-  }
-
-  const startedAt = now();
-  await env.DB.batch([
-    env.DB
-      .prepare(`
-        UPDATE migration_jobs
-        SET status = ?, current_stage = ?, progress_percent = ?, updated_at = ?
-        WHERE id = ?
-      `)
-      .bind("processing", "rewriting_pages", 75, startedAt, jobId),
-    eventStatement(
-      env,
-      jobId,
-      "info",
-      "rewriting_pages",
-      "Static HTML and CSS rewriting started.",
-      {
-        capturedPages: pages.length,
-        downloadedAssets: downloadedAssets.length,
-        blockedAssets: blockedAssets.length,
-      },
-      startedAt
-    ),
-  ]);
-
-  const rewrittenCss = [];
-  const cssWarnings = [];
-
-  for (const asset of downloadedAssets.filter((item) => item.asset_type === "stylesheet")) {
-    try {
-      const object = await env.STORAGE.get(asset.r2_key);
-      if (!object || !object.body) {
-        throw new Error(`Stylesheet missing from R2: ${asset.r2_key}`);
-      }
-
-      const originalCss = await object.text();
-      const rewritten = rewriteCss(originalCss, asset.source_url, assetMap);
-
-      await env.STORAGE.put(asset.r2_key, rewritten.css, {
-        httpMetadata: {
-          contentType: asset.content_type || "text/css; charset=utf-8",
-        },
-        customMetadata: {
-          jobId,
-          assetId: asset.id,
-          sourceUrl: asset.source_url,
-          rewritten: "true",
-        },
-      });
-
-      rewrittenCss.push({
-        assetId: asset.id,
-        outputPath: asset.output_path,
-        replacements: rewritten.replacements,
-      });
-    } catch (error) {
-      cssWarnings.push({
-        assetId: asset.id,
-        sourceUrl: asset.source_url,
-        error: errorMessage(error),
-      });
-    }
-  }
-
-  const rewrittenPages = [];
-  const pageWarnings = [];
-
-  for (const page of pages) {
-    try {
-      const capturedObject = await env.STORAGE.get(page.html_r2_key);
-      if (!capturedObject || !capturedObject.body) {
-        throw new Error(`Captured HTML missing from R2: ${page.html_r2_key}`);
-      }
-
-      const originalHtml = await capturedObject.text();
-      const result = rewriteHtml(originalHtml, page.source_url, assetMap, pageMap);
-      const finalKey = `${job.output_prefix}/site/${page.output_path || "index.html"}`;
-
-      await env.STORAGE.put(finalKey, result.html, {
-        httpMetadata: { contentType: "text/html; charset=utf-8" },
-        customMetadata: {
-          jobId,
-          pageId: page.id,
-          sourceUrl: page.source_url,
-          rewritten: "true",
-        },
-      });
-
-      rewrittenPages.push({
-        pageId: page.id,
-        sourceUrl: page.source_url,
-        outputPath: page.output_path,
-        r2Key: finalKey,
-        assetReplacements: result.assetReplacements,
-        internalLinkReplacements: result.internalLinkReplacements,
-        removedRuntimeBlocks: result.removedRuntimeBlocks,
-        htmlLength: result.html.length,
-      });
-    } catch (error) {
-      pageWarnings.push({
-        pageId: page.id,
-        sourceUrl: page.source_url,
-        error: errorMessage(error),
-      });
-    }
-  }
-
-  const manifest = {
-    version: VERSION,
-    jobId,
-    sourceUrl: job.source_url,
-    generatedAt: now(),
-    pages: rewrittenPages,
-    assets: downloadedAssets.map((asset) => ({
-      sourceUrl: asset.source_url,
-      outputPath: asset.output_path,
-      assetType: asset.asset_type,
-      contentType: asset.content_type,
-      byteSize: asset.byte_size,
-      r2Key: asset.r2_key,
-    })),
-    blockedAssets: blockedAssets.map((asset) => ({
-      sourceUrl: asset.source_url,
-      assetType: asset.asset_type,
-      reason: asset.error_message,
-    })),
-    warnings: { css: cssWarnings, pages: pageWarnings },
-  };
-
-  const manifestKey = `${job.output_prefix}/site/migration-manifest.json`;
-  await env.STORAGE.put(manifestKey, JSON.stringify(manifest, null, 2), {
-    httpMetadata: { contentType: "application/json; charset=utf-8" },
-    customMetadata: {
-      jobId,
-      generatedBy: `static-site-migrator-${VERSION}`,
-    },
-  });
-
-  const completedSuccessfully = pageWarnings.length === 0;
-  const warningCount = blockedAssets.length + cssWarnings.length + pageWarnings.length;
-  const completedAt = now();
-  const stage = completedSuccessfully
-    ? "pages_rewritten"
-    : "pages_rewritten_with_warnings";
-
-  await env.DB.batch([
-    env.DB
-      .prepare(`
-        UPDATE migration_jobs
-        SET status = ?, current_stage = ?, progress_percent = ?,
-            warning_count = warning_count + ?, updated_at = ?
-        WHERE id = ?
-      `)
-      .bind(
-        "processing",
-        stage,
-        completedSuccessfully ? 82 : 80,
-        cssWarnings.length + pageWarnings.length,
-        completedAt,
-        jobId
-      ),
-    eventStatement(
-      env,
-      jobId,
-      completedSuccessfully ? "info" : "warning",
-      stage,
-      completedSuccessfully
-        ? "Captured pages and stylesheets were rewritten into the final static-site structure."
-        : "Static-site rewriting completed with warnings.",
-      {
-        rewrittenPages: rewrittenPages.length,
-        rewrittenStylesheets: rewrittenCss.length,
-        blockedAssets: blockedAssets.length,
-        cssWarnings: cssWarnings.length,
-        pageWarnings: pageWarnings.length,
-        manifestKey,
-      },
-      completedAt
-    ),
-  ]);
-
-  return json({
-    success: completedSuccessfully,
-    jobId,
-    status: "processing",
-    currentStage: stage,
-    progressPercent: completedSuccessfully ? 82 : 80,
-    rewrittenPages: rewrittenPages.length,
-    rewrittenStylesheets: rewrittenCss.length,
-    downloadedAssets: downloadedAssets.length,
-    blockedAssets: blockedAssets.length,
-    warningCount,
-    manifestKey,
-    pages: rewrittenPages,
-    cssWarnings,
-    pageWarnings,
-  });
-}
-
-function rewriteHtml(html, pageUrl, assetMap, pageMap) {
-  let output = cleanMalformedQuotedUrls(html);
-  let assetReplacements = 0;
-  let internalLinkReplacements = 0;
-  let removedRuntimeBlocks = 0;
-
-  const orderedAssets = [...assetMap.entries()].sort(
-    (a, b) => b[0].length - a[0].length
-  );
-
-  for (const [sourceUrl, localPath] of orderedAssets) {
-    const variants = unique([
-      sourceUrl,
-      sourceUrl.replace(/&/g, "&amp;"),
-      encodeURI(sourceUrl),
-    ]);
-
-    for (const variant of variants) {
-      const result = replaceAllCount(output, variant, localPath);
-      output = result.text;
-      assetReplacements += result.count;
-    }
-  }
-
-  output = output.replace(
-    /\b(href)\s*=\s*(["'])(.*?)\2/gi,
-    (match, attribute, quote, value) => {
-      try {
-        const url = new URL(decodeHtml(value), pageUrl);
-        url.hash = "";
-        const local = pageMap.get(normaliseComparableUrl(url.href));
-        if (!local) return match;
-        internalLinkReplacements += 1;
-        return `${attribute}=${quote}${local}${quote}`;
-      } catch {
-        return match;
-      }
-    }
-  );
-
-  const serviceWorkerPattern = /<script\b[^>]*>[\s\S]*?runtime-service-worker\.js[\s\S]*?<\/script>/gi;
-  const beforeServiceWorker = output;
-  output = output.replace(serviceWorkerPattern, "");
-  if (output !== beforeServiceWorker) removedRuntimeBlocks += 1;
-
-  const analyticsPatterns = [
-    /<script\b[^>]*src=["'][^"']*sp-2\.0\.0-dm-0\.1\.min\.js[^"']*["'][^>]*><\/script>/gi,
-    /<script\b[^>]*id=["']d_track_campaign["'][^>]*>[\s\S]*?<\/script>/gi,
-  ];
-
-  for (const pattern of analyticsPatterns) {
-    const before = output;
-    output = output.replace(pattern, "");
-    if (output !== before) removedRuntimeBlocks += 1;
-  }
-
-  if (!/<!doctype\s+html/i.test(output)) {
-    output = `<!DOCTYPE html>\n${output}`;
-  }
-
-  return {
-    html: output,
-    assetReplacements,
-    internalLinkReplacements,
-    removedRuntimeBlocks,
-  };
-}
-
-function rewriteCss(css, stylesheetUrl, assetMap) {
-  let replacements = 0;
-
-  const output = css.replace(
-    /url\(\s*(["']?)(.*?)\1\s*\)/gi,
-    (match, quote, value) => {
-      const cleaned = decodeHtml(String(value || "").trim());
-      if (!cleaned || /^(data:|blob:|#)/i.test(cleaned)) return match;
-
-      try {
-        const absolute = normaliseUrl(new URL(cleaned, stylesheetUrl).href);
-        const local = assetMap.get(absolute);
-        if (!local) return match;
-        replacements += 1;
-        return `url("${local}")`;
-      } catch {
-        return match;
-      }
-    }
-  );
-
-  return { css: output, replacements };
-}
-
-function cleanMalformedQuotedUrls(value) {
-  return value
-    .replace(/https:\/\/[^\s"'<>]+\/%22(https%3A%2F%2F[^"'<>]+)%22/gi, (_, encoded) => {
-      try {
-        return decodeURIComponent(encoded);
-      } catch {
-        return encoded;
-      }
-    })
-    .replace(/https:\/\/[^\s"'<>]+\/%22(https:\/\/[^"'<>]+)%22/gi, "$1");
-}
-
-function outputPathToPublicUrl(outputPath) {
-  if (!outputPath || outputPath === "index.html") return "/";
-  return `/${outputPath.replace(/\/index\.html$/i, "").replace(/^\/+/, "")}/`;
-}
-
-function normaliseUrl(value) {
-  const url = new URL(value);
-  url.hash = "";
-  return url.href;
-}
-
-function normaliseComparableUrl(value) {
-  const url = new URL(value);
-  url.hash = "";
-
-  for (const key of [
-    "utm_source",
-    "utm_medium",
-    "utm_campaign",
-    "utm_term",
-    "utm_content",
-    "utm_id",
-    "gclid",
-    "fbclid",
-  ]) {
-    url.searchParams.delete(key);
-  }
-
-  if (url.pathname !== "/") {
-    url.pathname = url.pathname.replace(/\/+$/, "");
-  }
-
-  return url.href;
-}
-
-function replaceAllCount(input, search, replacement) {
-  if (!search || !input.includes(search)) {
-    return { text: input, count: 0 };
-  }
-
-  const parts = input.split(search);
-  return {
-    text: parts.join(replacement),
-    count: parts.length - 1,
-  };
-}
-
-function unique(values) {
-  return [...new Set(values.filter(Boolean))];
-}
-
-function decodeHtml(value) {
-  return value
-    .replace(/&amp;/gi, "&")
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;/gi, "'")
-    .replace(/&lt;/gi, "<")
-    .replace(/&gt;/gi, ">");
 }
 
 function eventStatement(env, jobId, level, stage, message, details, createdAt) {
@@ -670,7 +639,6 @@ function validateBindings(env) {
   const missing = [];
   if (!env.DB) missing.push("DB");
   if (!env.STORAGE) missing.push("STORAGE");
-
   if (missing.length) {
     throw new Error(`Missing Cloudflare binding(s): ${missing.join(", ")}`);
   }
