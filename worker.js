@@ -1,5 +1,4 @@
-const VERSION = "1.5.0";
-
+const VERSION = "1.6.1";
 const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
@@ -8,34 +7,29 @@ const CORS = {
 
 export default {
   async fetch(request, env) {
-    if (request.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: CORS });
-    }
-
+    if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
     const url = new URL(request.url);
     const pathname = url.pathname.replace(/\/+$/, "") || "/";
 
     try {
       validateBindings(env);
-
       if (request.method === "GET" && pathname === "/") {
         return json({ success: true, service: "Static Site Migrator Engine", version: VERSION, status: "online" });
       }
 
-      const previewMatch = url.pathname.match(/^\/preview\/([^/]+)(\/.*)?$/);
-      if (request.method === "GET" && previewMatch) {
-        return await servePreview(decodeURIComponent(previewMatch[1]), previewMatch[2] || "/", env);
+      const preview = url.pathname.match(/^\/preview\/([^/]+)(\/.*)?$/);
+      if (request.method === "GET" && preview) {
+        return servePreview(decodeURIComponent(preview[1]), preview[2] || "/", env);
       }
 
       let match = pathname.match(/^\/api\/migrations\/([^/]+)\/rewrite-pages$/);
-      if (request.method === "POST" && match) {
-        return await rewritePages(decodeURIComponent(match[1]), env);
-      }
+      if (request.method === "POST" && match) return rewritePages(decodeURIComponent(match[1]), env, false);
+
+      match = pathname.match(/^\/api\/migrations\/([^/]+)\/stabilise-conservative$/);
+      if (request.method === "POST" && match) return rewritePages(decodeURIComponent(match[1]), env, true);
 
       match = pathname.match(/^\/api\/migrations\/([^/]+)$/);
-      if (request.method === "GET" && match) {
-        return await getMigration(decodeURIComponent(match[1]), env);
-      }
+      if (request.method === "GET" && match) return getMigration(decodeURIComponent(match[1]), env);
 
       return json({ success: false, error: "Route not found." }, 404);
     } catch (error) {
@@ -45,90 +39,7 @@ export default {
   },
 };
 
-async function servePreview(jobId, requestedPath, env) {
-  const job = await env.DB.prepare("SELECT * FROM migration_jobs WHERE id = ?").bind(jobId).first();
-  if (!job) return new Response("Preview job not found.", { status: 404 });
-
-  let relativePath;
-  try { relativePath = decodeURIComponent(requestedPath || "/"); }
-  catch { return new Response("Invalid preview path.", { status: 400 }); }
-
-  relativePath = relativePath.replace(/^\/+/, "");
-  if (!relativePath) relativePath = "index.html";
-  if (relativePath.endsWith("/")) relativePath += "index.html";
-  if (relativePath.includes("..") || relativePath.includes("\\")) return new Response("Invalid preview path.", { status: 400 });
-
-  const candidates = [relativePath];
-  if (!hasFileExtension(relativePath)) candidates.push(`${relativePath}/index.html`);
-
-  let object = null;
-  let resolvedPath = null;
-  for (const candidate of candidates) {
-    const key = `${job.output_prefix}/site/${candidate}`;
-    object = await env.STORAGE.get(key);
-    if (object && object.body) { resolvedPath = candidate; break; }
-  }
-
-  if (!object || !object.body || !resolvedPath) return new Response("Preview file not found.", { status: 404 });
-
-  const contentType = object.httpMetadata?.contentType || guessContentType(resolvedPath);
-  const headers = new Headers({
-    "Content-Type": contentType,
-    "Cache-Control": "no-store, max-age=0",
-    "X-Robots-Tag": "noindex, nofollow",
-  });
-  const previewPrefix = `/preview/${encodeURIComponent(jobId)}`;
-
-  if (/text\/html/i.test(contentType)) {
-    let html = await object.text();
-    html = prefixPreviewHtmlUrls(html, previewPrefix);
-    return new Response(html, { status: 200, headers });
-  }
-  if (/text\/css/i.test(contentType)) {
-    let css = await object.text();
-    css = prefixPreviewCssUrls(css, previewPrefix);
-    return new Response(css, { status: 200, headers });
-  }
-  return new Response(object.body, { status: 200, headers });
-}
-
-function prefixPreviewHtmlUrls(html, prefix) {
-  let output = html.replace(/\b(href|src|poster|data-src|data-image-url)\s*=\s*(["'])\/(?!\/|preview\/)(.*?)\2/gi,
-    (_, attribute, quote, value) => `${attribute}=${quote}${prefix}/${value}${quote}`);
-  output = output.replace(/\bsrcset\s*=\s*(["'])(.*?)\1/gi, (match, quote, value) => {
-    const rewritten = value.split(",").map((candidate) => {
-      const parts = candidate.trim().split(/\s+/);
-      if (parts[0]?.startsWith("/") && !parts[0].startsWith("//") && !parts[0].startsWith("/preview/")) parts[0] = `${prefix}${parts[0]}`;
-      return parts.join(" ");
-    }).join(", ");
-    return `srcset=${quote}${rewritten}${quote}`;
-  });
-  return prefixPreviewCssUrls(output, prefix);
-}
-
-function prefixPreviewCssUrls(value, prefix) {
-  return value.replace(/url\(\s*(["']?)\/(?!\/|preview\/)(.*?)\1\s*\)/gi,
-    (_, quote, path) => `url(${quote}${prefix}/${path}${quote})`);
-}
-
-async function getMigration(jobId, env) {
-  const job = await env.DB.prepare("SELECT * FROM migration_jobs WHERE id = ?").bind(jobId).first();
-  if (!job) return json({ success: false, error: "Migration job not found." }, 404);
-  const [pagesResult, assetsResult, eventsResult] = await Promise.all([
-    env.DB.prepare("SELECT * FROM migration_pages WHERE job_id = ? ORDER BY source_url").bind(jobId).all(),
-    env.DB.prepare("SELECT * FROM migration_assets WHERE job_id = ? ORDER BY asset_type, source_url").bind(jobId).all(),
-    env.DB.prepare("SELECT * FROM migration_events WHERE job_id = ? ORDER BY created_at, id").bind(jobId).all(),
-  ]);
-  return json({
-    success: true,
-    job,
-    pages: pagesResult.results || [],
-    assets: assetsResult.results || [],
-    events: (eventsResult.results || []).map((event) => ({ ...event, details: parseJson(event.details_json), details_json: undefined })),
-  });
-}
-
-async function rewritePages(jobId, env) {
+async function rewritePages(jobId, env, conservative) {
   const job = await env.DB.prepare("SELECT * FROM migration_jobs WHERE id = ?").bind(jobId).first();
   if (!job) return json({ success: false, error: "Migration job not found." }, 404);
 
@@ -136,153 +47,262 @@ async function rewritePages(jobId, env) {
     env.DB.prepare(`SELECT * FROM migration_pages WHERE job_id = ? AND status = 'captured' AND html_r2_key IS NOT NULL ORDER BY source_url`).bind(jobId).all(),
     env.DB.prepare(`SELECT * FROM migration_assets WHERE job_id = ? ORDER BY source_url`).bind(jobId).all(),
   ]);
-
   const pages = pagesResult.results || [];
   const assets = assetsResult.results || [];
   if (!pages.length) return json({ success: false, error: "No captured pages are available." }, 409);
 
-  const downloadedAssets = assets.filter((asset) => asset.status === "downloaded" && asset.output_path && asset.r2_key);
-  const blockedAssets = assets.filter((asset) => asset.status === "blocked");
+  const downloaded = assets.filter((a) => a.status === "downloaded" && a.output_path && a.r2_key);
+  const blocked = assets.filter((a) => a.status === "blocked");
+  const assetMap = new Map(downloaded.map((a) => [normaliseUrl(a.source_url), `/${a.output_path}`]));
+  const pageMap = new Map(pages.map((p) => [normaliseComparableUrl(p.source_url), outputPathToPublicUrl(p.output_path)]));
+  const stage = conservative ? "stabilising_conservatively" : "rewriting_pages";
+  const started = now();
 
-  const assetMap = new Map();
-  for (const asset of downloadedAssets) assetMap.set(normaliseUrl(asset.source_url), `/${asset.output_path}`);
-
-  const pageMap = new Map();
-  for (const page of pages) pageMap.set(normaliseComparableUrl(page.source_url), outputPathToPublicUrl(page.output_path));
-
-  const startedAt = now();
   await env.DB.batch([
-    env.DB.prepare(`UPDATE migration_jobs SET status = ?, current_stage = ?, progress_percent = ?, updated_at = ? WHERE id = ?`).bind("processing", "rewriting_pages", 75, startedAt, jobId),
-    eventStatement(env, jobId, "info", "rewriting_pages", "Static HTML and CSS rewriting started.", { capturedPages: pages.length, downloadedAssets: downloadedAssets.length, blockedAssets: blockedAssets.length }, startedAt),
+    env.DB.prepare(`UPDATE migration_jobs SET status='processing', current_stage=?, progress_percent=?, updated_at=? WHERE id=?`)
+      .bind(stage, conservative ? 86 : 75, started, jobId),
+    eventStatement(env, jobId, "info", stage,
+      conservative ? "Conservative in-place widget stabilisation started." : "Static HTML and CSS rewriting started.",
+      { pages: pages.length, downloadedAssets: downloaded.length, blockedAssets: blocked.length }, started),
   ]);
 
-  const rewrittenCss = [];
   const cssWarnings = [];
-  for (const asset of downloadedAssets.filter((item) => item.asset_type === "stylesheet")) {
+  let rewrittenStylesheets = 0;
+  for (const asset of downloaded.filter((a) => a.asset_type === "stylesheet")) {
     try {
       const object = await env.STORAGE.get(asset.r2_key);
-      if (!object || !object.body) throw new Error(`Stylesheet missing from R2: ${asset.r2_key}`);
-      const originalCss = await object.text();
-      const rewritten = rewriteCss(originalCss, asset.source_url, assetMap);
+      if (!object?.body) throw new Error(`Stylesheet missing from R2: ${asset.r2_key}`);
+      const rewritten = rewriteCss(await object.text(), asset.source_url, assetMap);
       await env.STORAGE.put(asset.r2_key, rewritten.css, {
         httpMetadata: { contentType: asset.content_type || "text/css; charset=utf-8" },
         customMetadata: { jobId, assetId: asset.id, sourceUrl: asset.source_url, rewritten: "true" },
       });
-      rewrittenCss.push({ assetId: asset.id, outputPath: asset.output_path, replacements: rewritten.replacements });
+      rewrittenStylesheets += 1;
     } catch (error) {
       cssWarnings.push({ assetId: asset.id, sourceUrl: asset.source_url, error: errorMessage(error) });
     }
   }
 
-  const rewrittenPages = [];
-  const pageWarnings = [];
+  const results = [];
+  const warnings = [];
   for (const page of pages) {
     try {
-      const capturedObject = await env.STORAGE.get(page.html_r2_key);
-      if (!capturedObject || !capturedObject.body) throw new Error(`Captured HTML missing from R2: ${page.html_r2_key}`);
-      const originalHtml = await capturedObject.text();
-      const result = rewriteHtml(originalHtml, page.source_url, assetMap, pageMap);
-      const finalKey = `${job.output_prefix}/site/${page.output_path || "index.html"}`;
-      await env.STORAGE.put(finalKey, result.html, {
+      const object = await env.STORAGE.get(page.html_r2_key);
+      if (!object?.body) throw new Error(`Captured HTML missing from R2: ${page.html_r2_key}`);
+      const base = rewriteHtml(await object.text(), page.source_url, assetMap, pageMap);
+      const stabilised = conservative ? addConservativeStabiliser(base.html) : { html: base.html, injected: false };
+      const key = `${job.output_prefix}/site/${page.output_path || "index.html"}`;
+      await env.STORAGE.put(key, stabilised.html, {
         httpMetadata: { contentType: "text/html; charset=utf-8" },
-        customMetadata: { jobId, pageId: page.id, sourceUrl: page.source_url, rewritten: "true" },
+        customMetadata: {
+          jobId,
+          pageId: page.id,
+          sourceUrl: page.source_url,
+          rewritten: "true",
+          conservativeStabilisation: conservative ? "true" : "false",
+          version: VERSION,
+        },
       });
-      rewrittenPages.push({
+      results.push({
         pageId: page.id,
         sourceUrl: page.source_url,
         outputPath: page.output_path,
-        r2Key: finalKey,
-        assetReplacements: result.assetReplacements,
-        internalLinkReplacements: result.internalLinkReplacements,
-        removedRuntimeBlocks: result.removedRuntimeBlocks,
-        htmlLength: result.html.length,
+        r2Key: key,
+        assetReplacements: base.assetReplacements,
+        internalLinkReplacements: base.internalLinkReplacements,
+        removedRuntimeBlocks: base.removedRuntimeBlocks,
+        conservativeStabiliserInjected: stabilised.injected,
+        htmlLength: stabilised.html.length,
       });
     } catch (error) {
-      pageWarnings.push({ pageId: page.id, sourceUrl: page.source_url, error: errorMessage(error) });
+      warnings.push({ pageId: page.id, sourceUrl: page.source_url, error: errorMessage(error) });
     }
   }
 
-  const manifest = {
+  const finished = now();
+  const finalStage = conservative ? "conservative_stabilisation_complete" : "pages_rewritten";
+  const success = warnings.length === 0;
+  const report = {
     version: VERSION,
+    mode: conservative ? "conservative-in-place" : "baseline-rewrite",
     jobId,
-    sourceUrl: job.source_url,
-    generatedAt: now(),
-    pages: rewrittenPages,
-    assets: downloadedAssets.map((asset) => ({ sourceUrl: asset.source_url, outputPath: asset.output_path, assetType: asset.asset_type, contentType: asset.content_type, byteSize: asset.byte_size, r2Key: asset.r2_key })),
-    blockedAssets: blockedAssets.map((asset) => ({ sourceUrl: asset.source_url, assetType: asset.asset_type, reason: asset.error_message })),
-    warnings: { css: cssWarnings, pages: pageWarnings },
+    generatedAt: finished,
+    pages: results,
+    downloadedAssets: downloaded.length,
+    blockedAssets: blocked.length,
+    warnings: { pages: warnings, css: cssWarnings },
   };
-
-  const manifestKey = `${job.output_prefix}/site/migration-manifest.json`;
-  await env.STORAGE.put(manifestKey, JSON.stringify(manifest, null, 2), {
+  const reportKey = `${job.output_prefix}/site/${conservative ? "conservative-stabilisation-report.json" : "migration-manifest.json"}`;
+  await env.STORAGE.put(reportKey, JSON.stringify(report, null, 2), {
     httpMetadata: { contentType: "application/json; charset=utf-8" },
     customMetadata: { jobId, generatedBy: `static-site-migrator-${VERSION}` },
   });
 
-  const completedSuccessfully = pageWarnings.length === 0;
-  const warningCount = blockedAssets.length + cssWarnings.length + pageWarnings.length;
-  const completedAt = now();
-  const stage = completedSuccessfully ? "pages_rewritten" : "pages_rewritten_with_warnings";
-
   await env.DB.batch([
-    env.DB.prepare(`UPDATE migration_jobs SET status = ?, current_stage = ?, progress_percent = ?, warning_count = warning_count + ?, updated_at = ? WHERE id = ?`).bind("processing", stage, completedSuccessfully ? 82 : 80, cssWarnings.length + pageWarnings.length, completedAt, jobId),
-    eventStatement(env, jobId, completedSuccessfully ? "info" : "warning", stage,
-      completedSuccessfully ? "Captured pages and stylesheets were rewritten into the final static-site structure." : "Static-site rewriting completed with warnings.",
-      { rewrittenPages: rewrittenPages.length, rewrittenStylesheets: rewrittenCss.length, blockedAssets: blockedAssets.length, cssWarnings: cssWarnings.length, pageWarnings: pageWarnings.length, manifestKey }, completedAt),
+    env.DB.prepare(`UPDATE migration_jobs SET status='processing', current_stage=?, progress_percent=?, warning_count=warning_count+?, updated_at=? WHERE id=?`)
+      .bind(finalStage, conservative ? 92 : 82, warnings.length + cssWarnings.length, finished, jobId),
+    eventStatement(env, jobId, success ? "info" : "warning", finalStage,
+      conservative
+        ? "Layout-preserving widget and animation stabilisation completed without restructuring page markup."
+        : "Captured pages were restored to the baseline static-site structure.",
+      { pages: results.length, rewrittenStylesheets, pageWarnings: warnings.length, cssWarnings: cssWarnings.length, reportKey }, finished),
   ]);
 
   return json({
-    success: completedSuccessfully,
+    success,
     jobId,
     status: "processing",
-    currentStage: stage,
-    progressPercent: completedSuccessfully ? 82 : 80,
-    rewrittenPages: rewrittenPages.length,
-    rewrittenStylesheets: rewrittenCss.length,
-    downloadedAssets: downloadedAssets.length,
-    blockedAssets: blockedAssets.length,
-    warningCount,
-    manifestKey,
-    pages: rewrittenPages,
+    currentStage: finalStage,
+    progressPercent: conservative ? 92 : 82,
+    pagesProcessed: results.length,
+    rewrittenStylesheets,
+    downloadedAssets: downloaded.length,
+    blockedAssets: blocked.length,
+    reportKey,
+    pages: results,
+    warnings,
     cssWarnings,
-    pageWarnings,
   });
+}
+
+function addConservativeStabiliser(html) {
+  const marker = "static-migrator-conservative-v1";
+  if (html.includes(marker)) return { html, injected: false };
+
+  const payload = `
+<style id="${marker}">
+/* Layout-preserving overrides: no display, position, width, grid or flex changes. */
+html.static-migrator-ready [style*="opacity: 0"],
+html.static-migrator-ready [style*="opacity:0"],
+html.static-migrator-ready .dmAnimation,
+html.static-migrator-ready .dmNewParagraph[data-anim-desktop],
+html.static-migrator-ready [data-anim-desktop],
+html.static-migrator-ready [data-animation],
+html.static-migrator-ready .wow,
+html.static-migrator-ready .animated {
+  opacity: 1 !important;
+  visibility: visible !important;
+  transform: none !important;
+  animation: none !important;
+  transition: none !important;
+}
+html.static-migrator-ready .skrollable,
+html.static-migrator-ready .skrollable-before,
+html.static-migrator-ready .skrollable-after {
+  opacity: 1 !important;
+  visibility: visible !important;
+  transform: none !important;
+}
+html.static-migrator-ready [data-static-migrator-active-slide="true"] {
+  opacity: 1 !important;
+  visibility: visible !important;
+  transform: none !important;
+  z-index: 2 !important;
+}
+</style>
+<script id="${marker}-script">
+(function () {
+  function visibleImage(el) {
+    if (!el || el.nodeType !== 1) return false;
+    if (el.matches('img[src], source[srcset], [style*="background-image"], [data-image-url], [data-src]')) return true;
+    return !!el.querySelector('img[src], source[srcset], [style*="background-image"], [data-image-url], [data-src]');
+  }
+
+  function finishAnimations(root) {
+    var selectors = [
+      '[data-anim-desktop]', '[data-animation]', '.dmAnimation', '.wow', '.animated',
+      '.skrollable', '.skrollable-before', '.skrollable-after'
+    ];
+    root.querySelectorAll(selectors.join(',')).forEach(function (el) {
+      el.style.setProperty('opacity', '1', 'important');
+      el.style.setProperty('visibility', 'visible', 'important');
+      el.style.setProperty('transform', 'none', 'important');
+      el.style.setProperty('animation', 'none', 'important');
+      el.style.setProperty('transition', 'none', 'important');
+    });
+  }
+
+  function stabiliseWidgets(root) {
+    var widgetSelector = [
+      '[class*="carousel" i]', '[class*="slider" i]', '[class*="slideshow" i]',
+      '[data-widget-type*="slider" i]', '[data-widget-type*="gallery" i]',
+      '[data-element-type*="slider" i]', '[data-element-type*="gallery" i]'
+    ].join(',');
+
+    root.querySelectorAll(widgetSelector).forEach(function (widget) {
+      var candidates = Array.from(widget.children).filter(visibleImage);
+      if (!candidates.length) {
+        candidates = Array.from(widget.querySelectorAll('[class*="slide" i], [class*="item" i], li')).filter(visibleImage);
+      }
+      if (!candidates.length) return;
+
+      var active = candidates.find(function (el) {
+        return el.classList.contains('active') || el.getAttribute('aria-hidden') === 'false' || el.getAttribute('data-active') === 'true';
+      }) || candidates[0];
+
+      active.setAttribute('data-static-migrator-active-slide', 'true');
+      active.style.setProperty('opacity', '1', 'important');
+      active.style.setProperty('visibility', 'visible', 'important');
+      active.style.setProperty('transform', 'none', 'important');
+
+      var image = active.matches('img') ? active : active.querySelector('img');
+      if (image) {
+        var lazy = image.getAttribute('data-src') || image.getAttribute('data-lazy-src') || image.getAttribute('data-original');
+        if (lazy && (!image.getAttribute('src') || image.getAttribute('src').indexOf('data:image') === 0)) image.setAttribute('src', lazy);
+      }
+    });
+  }
+
+  function run() {
+    document.documentElement.classList.add('static-migrator-ready');
+    finishAnimations(document);
+    stabiliseWidgets(document);
+  }
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', run, { once: true });
+  else run();
+  window.addEventListener('load', run, { once: true });
+  setTimeout(run, 500);
+  setTimeout(run, 1500);
+})();
+</script>`;
+
+  if (/<\/body>/i.test(html)) return { html: html.replace(/<\/body>/i, `${payload}\n</body>`), injected: true };
+  return { html: `${html}\n${payload}`, injected: true };
 }
 
 function rewriteHtml(html, pageUrl, assetMap, pageMap) {
   let output = cleanMalformedQuotedUrls(html);
-  let assetReplacements = 0, internalLinkReplacements = 0, removedRuntimeBlocks = 0;
-  const orderedAssets = [...assetMap.entries()].sort((a, b) => b[0].length - a[0].length);
-  for (const [sourceUrl, localPath] of orderedAssets) {
-    const variants = unique([sourceUrl, sourceUrl.replace(/&/g, "&amp;"), encodeURI(sourceUrl)]);
-    for (const variant of variants) {
+  let assetReplacements = 0;
+  let internalLinkReplacements = 0;
+  let removedRuntimeBlocks = 0;
+
+  const ordered = [...assetMap.entries()].sort((a, b) => b[0].length - a[0].length);
+  for (const [sourceUrl, localPath] of ordered) {
+    for (const variant of unique([sourceUrl, sourceUrl.replace(/&/g, "&amp;"), encodeURI(sourceUrl)])) {
       const result = replaceAllCount(output, variant, localPath);
       output = result.text;
       assetReplacements += result.count;
     }
   }
 
-  output = output.replace(/\b(href)\s*=\s*(["'])(.*?)\2/gi, (match, attribute, quote, value) => {
+  output = output.replace(/\bhref\s*=\s*(["'])(.*?)\1/gi, (match, quote, value) => {
     try {
       const url = new URL(decodeHtml(value), pageUrl);
       url.hash = "";
       const local = pageMap.get(normaliseComparableUrl(url.href));
       if (!local) return match;
       internalLinkReplacements += 1;
-      return `${attribute}=${quote}${local}${quote}`;
+      return `href=${quote}${local}${quote}`;
     } catch { return match; }
   });
 
-  const serviceWorkerPattern = /<script\b[^>]*>[\s\S]*?runtime-service-worker\.js[\s\S]*?<\/script>/gi;
-  const beforeServiceWorker = output;
-  output = output.replace(serviceWorkerPattern, "");
-  if (output !== beforeServiceWorker) removedRuntimeBlocks += 1;
-
-  const analyticsPatterns = [
+  const patterns = [
+    /<script\b[^>]*>[\s\S]*?runtime-service-worker\.js[\s\S]*?<\/script>/gi,
     /<script\b[^>]*src=["'][^"']*sp-2\.0\.0-dm-0\.1\.min\.js[^"']*["'][^>]*><\/script>/gi,
     /<script\b[^>]*id=["']d_track_campaign["'][^>]*>[\s\S]*?<\/script>/gi,
   ];
-  for (const pattern of analyticsPatterns) {
+  for (const pattern of patterns) {
     const before = output;
     output = output.replace(pattern, "");
     if (output !== before) removedRuntimeBlocks += 1;
@@ -297,8 +317,7 @@ function rewriteCss(css, stylesheetUrl, assetMap) {
     const cleaned = decodeHtml(String(value || "").trim());
     if (!cleaned || /^(data:|blob:|#)/i.test(cleaned)) return match;
     try {
-      const absolute = normaliseUrl(new URL(cleaned, stylesheetUrl).href);
-      const local = assetMap.get(absolute);
+      const local = assetMap.get(normaliseUrl(new URL(cleaned, stylesheetUrl).href));
       if (!local) return match;
       replacements += 1;
       return `url("${local}")`;
@@ -307,50 +326,99 @@ function rewriteCss(css, stylesheetUrl, assetMap) {
   return { css: output, replacements };
 }
 
-function cleanMalformedQuotedUrls(value) {
-  return value
-    .replace(/https:\/\/[^\s"'<>]+\/%22(https%3A%2F%2F[^"'<>]+)%22/gi, (_, encoded) => { try { return decodeURIComponent(encoded); } catch { return encoded; } })
-    .replace(/https:\/\/[^\s"'<>]+\/%22(https:\/\/[^"'<>]+)%22/gi, "$1");
+async function servePreview(jobId, requestedPath, env) {
+  const job = await env.DB.prepare("SELECT * FROM migration_jobs WHERE id = ?").bind(jobId).first();
+  if (!job) return new Response("Preview job not found.", { status: 404 });
+  let path;
+  try { path = decodeURIComponent(requestedPath || "/"); }
+  catch { return new Response("Invalid preview path.", { status: 400 }); }
+  path = path.replace(/^\/+/, "");
+  if (!path) path = "index.html";
+  if (path.endsWith("/")) path += "index.html";
+  if (path.includes("..") || path.includes("\\")) return new Response("Invalid preview path.", { status: 400 });
+
+  const candidates = [path];
+  if (!hasFileExtension(path)) candidates.push(`${path}/index.html`);
+  let object = null, resolved = null;
+  for (const candidate of candidates) {
+    object = await env.STORAGE.get(`${job.output_prefix}/site/${candidate}`);
+    if (object?.body) { resolved = candidate; break; }
+  }
+  if (!object?.body || !resolved) return new Response("Preview file not found.", { status: 404 });
+
+  const type = object.httpMetadata?.contentType || guessContentType(resolved);
+  const headers = new Headers({ "Content-Type": type, "Cache-Control": "no-store, max-age=0", "X-Robots-Tag": "noindex, nofollow" });
+  const prefix = `/preview/${encodeURIComponent(jobId)}`;
+  if (/text\/html/i.test(type)) return new Response(prefixPreviewHtmlUrls(await object.text(), prefix), { status: 200, headers });
+  if (/text\/css/i.test(type)) return new Response(prefixPreviewCssUrls(await object.text(), prefix), { status: 200, headers });
+  return new Response(object.body, { status: 200, headers });
 }
 
-function outputPathToPublicUrl(outputPath) {
-  if (!outputPath || outputPath === "index.html") return "/";
-  return `/${outputPath.replace(/\/index\.html$/i, "").replace(/^\/+/, "")}/`;
+function prefixPreviewHtmlUrls(html, prefix) {
+  let output = html.replace(/\b(href|src|poster|data-src|data-image-url)\s*=\s*(["'])\/(?!\/|preview\/)(.*?)\2/gi,
+    (_, attr, quote, value) => `${attr}=${quote}${prefix}/${value}${quote}`);
+  output = output.replace(/\bsrcset\s*=\s*(["'])(.*?)\1/gi, (match, quote, value) => {
+    const rewritten = value.split(",").map((candidate) => {
+      const parts = candidate.trim().split(/\s+/);
+      if (parts[0]?.startsWith("/") && !parts[0].startsWith("//") && !parts[0].startsWith("/preview/")) parts[0] = `${prefix}${parts[0]}`;
+      return parts.join(" ");
+    }).join(", ");
+    return `srcset=${quote}${rewritten}${quote}`;
+  });
+  return prefixPreviewCssUrls(output, prefix);
 }
-function normaliseUrl(value) { const url = new URL(value); url.hash = ""; return url.href; }
+function prefixPreviewCssUrls(value, prefix) {
+  return value.replace(/url\(\s*(["']?)\/(?!\/|preview\/)(.*?)\1\s*\)/gi,
+    (_, quote, path) => `url(${quote}${prefix}/${path}${quote})`);
+}
+
+async function getMigration(jobId, env) {
+  const job = await env.DB.prepare("SELECT * FROM migration_jobs WHERE id = ?").bind(jobId).first();
+  if (!job) return json({ success: false, error: "Migration job not found." }, 404);
+  return json({ success: true, job });
+}
+
+function cleanMalformedQuotedUrls(value) {
+  return value
+    .replace(/https:\/\/[^\s"'<>]+\/%22(https%3A%2F%2F[^"'<>]+)%22/gi, (_, encoded) => {
+      try { return decodeURIComponent(encoded); } catch { return encoded; }
+    })
+    .replace(/https:\/\/[^\s"'<>]+\/%22(https:\/\/[^"'<>]+)%22/gi, "$1");
+}
+function outputPathToPublicUrl(path) {
+  if (!path || path === "index.html") return "/";
+  return `/${path.replace(/\/index\.html$/i, "").replace(/^\/+/, "")}/`;
+}
+function normaliseUrl(value) { const u = new URL(value); u.hash = ""; return u.href; }
 function normaliseComparableUrl(value) {
-  const url = new URL(value); url.hash = "";
-  for (const key of ["utm_source","utm_medium","utm_campaign","utm_term","utm_content","utm_id","gclid","fbclid"]) url.searchParams.delete(key);
-  if (url.pathname !== "/") url.pathname = url.pathname.replace(/\/+$/, "");
-  return url.href;
+  const u = new URL(value); u.hash = "";
+  for (const key of ["utm_source","utm_medium","utm_campaign","utm_term","utm_content","utm_id","gclid","fbclid"]) u.searchParams.delete(key);
+  if (u.pathname !== "/") u.pathname = u.pathname.replace(/\/+$/, "");
+  return u.href;
 }
 function replaceAllCount(input, search, replacement) {
   if (!search || !input.includes(search)) return { text: input, count: 0 };
-  const parts = input.split(search);
-  return { text: parts.join(replacement), count: parts.length - 1 };
+  const parts = input.split(search); return { text: parts.join(replacement), count: parts.length - 1 };
 }
 function unique(values) { return [...new Set(values.filter(Boolean))]; }
 function decodeHtml(value) {
-  return value.replace(/&amp;/gi, "&").replace(/&quot;/gi, '"').replace(/&#39;/gi, "'").replace(/&lt;/gi, "<").replace(/&gt;/gi, ">");
+  return value.replace(/&amp;/gi,"&").replace(/&quot;/gi,'"').replace(/&#39;/gi,"'").replace(/&lt;/gi,"<").replace(/&gt;/gi,">");
 }
 function eventStatement(env, jobId, level, stage, message, details, createdAt) {
-  return env.DB.prepare(`INSERT INTO migration_events (job_id, level, stage, message, details_json, created_at) VALUES (?, ?, ?, ?, ?, ?)`)
+  return env.DB.prepare(`INSERT INTO migration_events(job_id,level,stage,message,details_json,created_at) VALUES(?,?,?,?,?,?)`)
     .bind(jobId, level, stage, message, details == null ? null : JSON.stringify(details), createdAt);
 }
 function hasFileExtension(path) { return /\.[a-zA-Z0-9]{1,10}$/.test(path.split("?")[0]); }
 function guessContentType(path) {
-  const lower = path.toLowerCase();
-  const types = [[".html","text/html; charset=utf-8"],[".css","text/css; charset=utf-8"],[".js","application/javascript; charset=utf-8"],[".json","application/json; charset=utf-8"],[".png","image/png"],[".jpg","image/jpeg"],[".jpeg","image/jpeg"],[".gif","image/gif"],[".webp","image/webp"],[".svg","image/svg+xml"],[".ico","image/x-icon"],[".woff2","font/woff2"],[".woff","font/woff"],[".ttf","font/ttf"],[".otf","font/otf"],[".mp4","video/mp4"],[".webm","video/webm"],[".mp3","audio/mpeg"]];
-  for (const [extension, type] of types) if (lower.endsWith(extension)) return type;
+  const p = path.toLowerCase();
+  const types = [[".html","text/html; charset=utf-8"],[".css","text/css; charset=utf-8"],[".js","application/javascript; charset=utf-8"],[".json","application/json; charset=utf-8"],[".png","image/png"],[".jpg","image/jpeg"],[".jpeg","image/jpeg"],[".gif","image/gif"],[".webp","image/webp"],[".svg","image/svg+xml"],[".ico","image/x-icon"],[".woff2","font/woff2"],[".woff","font/woff"],[".ttf","font/ttf"],[".otf","font/otf"]];
+  for (const [ext,type] of types) if (p.endsWith(ext)) return type;
   return "application/octet-stream";
 }
 function validateBindings(env) {
-  const missing = [];
-  if (!env.DB) missing.push("DB");
-  if (!env.STORAGE) missing.push("STORAGE");
+  const missing = []; if (!env.DB) missing.push("DB"); if (!env.STORAGE) missing.push("STORAGE");
   if (missing.length) throw new Error(`Missing Cloudflare binding(s): ${missing.join(", ")}`);
 }
-function parseJson(value) { if (value == null || value === "") return null; try { return JSON.parse(value); } catch { return value; } }
 function now() { return new Date().toISOString(); }
 function errorMessage(error) { return error instanceof Error ? error.message : String(error || "Unexpected server error."); }
 function json(data, status = 200) { return Response.json(data, { status, headers: CORS }); }
