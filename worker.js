@@ -1,4 +1,4 @@
-const VERSION = "1.6.3";
+const VERSION = "1.6.4";
 const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
@@ -23,9 +23,9 @@ export default {
         return servePreview(decodeURIComponent(preview[1]), preview[2] || "/", env);
       }
 
-      let match = pathname.match(/^\/api\/migrations\/([^/]+)\/restore-overlays-safe$/);
+      let match = pathname.match(/^\/api\/migrations\/([^/]+)\/freeze-hero-state$/);
       if (request.method === "POST" && match) {
-        return restoreOverlaysSafe(decodeURIComponent(match[1]), env);
+        return freezeHeroState(decodeURIComponent(match[1]), env);
       }
 
       match = pathname.match(/^\/api\/migrations\/([^/]+)$/);
@@ -42,28 +42,28 @@ export default {
   },
 };
 
-async function restoreOverlaysSafe(jobId, env) {
+async function freezeHeroState(jobId, env) {
   const job = await getJob(jobId, env);
   if (!job) return json({ success: false, error: "Migration job not found." }, 404);
 
-  const pagesResult = await env.DB.prepare(`
+  const result = await env.DB.prepare(`
     SELECT id, source_url, output_path
     FROM migration_pages
     WHERE job_id = ? AND status = 'captured'
     ORDER BY source_url
   `).bind(jobId).all();
 
-  const pages = pagesResult.results || [];
+  const pages = result.results || [];
   if (!pages.length) return json({ success: false, error: "No generated pages are available." }, 409);
 
   const startedAt = now();
   await env.DB.batch([
     env.DB.prepare(`UPDATE migration_jobs SET status='processing', current_stage=?, progress_percent=?, updated_at=? WHERE id=?`)
-      .bind("restoring_overlays_safely", 96, startedAt, jobId),
-    eventStatement(env, jobId, "info", "restoring_overlays_safely", "Safe overlay restoration started.", { pages: pages.length }, startedAt),
+      .bind("freezing_hero_state", 97, startedAt, jobId),
+    eventStatement(env, jobId, "info", "freezing_hero_state", "Late-running slider runtime removal started.", { pages: pages.length }, startedAt),
   ]);
 
-  const restored = [];
+  const processed = [];
   const warnings = [];
 
   for (const page of pages) {
@@ -74,22 +74,30 @@ async function restoreOverlaysSafe(jobId, env) {
       const object = await env.STORAGE.get(key);
       if (!object?.body) throw new Error(`Generated page is missing from R2: ${key}`);
 
-      let html = await object.text();
-      html = removeOldOverlayPayload(html);
-      html = injectSafeOverlayPayload(html);
+      const original = await object.text();
+      const fixed = freezeHtml(original);
 
-      await env.STORAGE.put(key, html, {
+      await env.STORAGE.put(key, fixed.html, {
         httpMetadata: { contentType: "text/html; charset=utf-8" },
         customMetadata: {
           jobId,
           pageId: page.id,
           sourceUrl: page.source_url,
-          safeOverlayRestoration: "true",
+          heroStateFrozen: "true",
           version: VERSION,
         },
       });
 
-      restored.push({ pageId: page.id, sourceUrl: page.source_url, outputPath, r2Key: key, htmlLength: html.length });
+      processed.push({
+        pageId: page.id,
+        sourceUrl: page.source_url,
+        outputPath,
+        r2Key: key,
+        scriptsRemoved: fixed.scriptsRemoved,
+        payloadsRemoved: fixed.payloadsRemoved,
+        safeguardInjected: fixed.safeguardInjected,
+        htmlLength: fixed.html.length,
+      });
     } catch (error) {
       warnings.push({ pageId: page.id, sourceUrl: page.source_url, error: errorMessage(error) });
     }
@@ -97,20 +105,20 @@ async function restoreOverlaysSafe(jobId, env) {
 
   const completedAt = now();
   const success = warnings.length === 0;
-  const stage = success ? "safe_overlays_restored" : "safe_overlays_restored_with_warnings";
-  const reportKey = `${job.output_prefix}/site/safe-overlay-restoration-report.json`;
+  const stage = success ? "hero_state_frozen" : "hero_state_frozen_with_warnings";
+  const reportKey = `${job.output_prefix}/site/hero-freeze-report.json`;
 
-  await env.STORAGE.put(reportKey, JSON.stringify({ version: VERSION, jobId, generatedAt: completedAt, pages: restored, warnings }, null, 2), {
+  await env.STORAGE.put(reportKey, JSON.stringify({ version: VERSION, jobId, generatedAt: completedAt, pages: processed, warnings }, null, 2), {
     httpMetadata: { contentType: "application/json; charset=utf-8" },
     customMetadata: { jobId, generatedBy: `static-site-migrator-${VERSION}` },
   });
 
   await env.DB.batch([
     env.DB.prepare(`UPDATE migration_jobs SET status='processing', current_stage=?, progress_percent=?, warning_count=warning_count+?, updated_at=? WHERE id=?`)
-      .bind(stage, success ? 97 : 96, warnings.length, completedAt, jobId),
+      .bind(stage, success ? 98 : 97, warnings.length, completedAt, jobId),
     eventStatement(env, jobId, success ? "info" : "warning", stage,
-      success ? "Visible active-slide overlays were restored without revealing hidden placeholders." : "Safe overlay restoration completed with warnings.",
-      { pagesRestored: restored.length, warnings: warnings.length, reportKey }, completedAt),
+      success ? "Initial rendered hero state was preserved and late-running slider scripts were removed." : "Hero state freeze completed with warnings.",
+      { pagesProcessed: processed.length, warnings: warnings.length, reportKey }, completedAt),
   ]);
 
   return json({
@@ -118,116 +126,76 @@ async function restoreOverlaysSafe(jobId, env) {
     jobId,
     status: "processing",
     currentStage: stage,
-    progressPercent: success ? 97 : 96,
-    pagesProcessed: restored.length,
+    progressPercent: success ? 98 : 97,
+    pagesProcessed: processed.length,
     reportKey,
-    pages: restored,
+    pages: processed,
     warnings,
   });
 }
 
-function removeOldOverlayPayload(html) {
-  return html
-    .replace(/<style\b[^>]*id=["']static-migrator-overlay-v162["'][^>]*>[\s\S]*?<\/style>/gi, "")
-    .replace(/<script\b[^>]*id=["']static-migrator-overlay-v162-script["'][^>]*>[\s\S]*?<\/script>/gi, "")
-    .replace(/<style\b[^>]*id=["']static-migrator-overlay-v163["'][^>]*>[\s\S]*?<\/style>/gi, "")
-    .replace(/<script\b[^>]*id=["']static-migrator-overlay-v163-script["'][^>]*>[\s\S]*?<\/script>/gi, "");
-}
+function freezeHtml(html) {
+  let output = html;
+  let payloadsRemoved = 0;
+  let scriptsRemoved = 0;
 
-function injectSafeOverlayPayload(html) {
-  const payload = `
-<style id="static-migrator-overlay-v163">
-html.static-migrator-safe-overlays [data-static-migrator-safe-overlay="true"] {
+  const payloadPatterns = [
+    /<style\b[^>]*id=["']static-migrator-overlay-v162["'][^>]*>[\s\S]*?<\/style>/gi,
+    /<script\b[^>]*id=["']static-migrator-overlay-v162-script["'][^>]*>[\s\S]*?<\/script>/gi,
+    /<style\b[^>]*id=["']static-migrator-overlay-v163["'][^>]*>[\s\S]*?<\/style>/gi,
+    /<script\b[^>]*id=["']static-migrator-overlay-v163-script["'][^>]*>[\s\S]*?<\/script>/gi,
+  ];
+
+  for (const pattern of payloadPatterns) {
+    const before = output;
+    output = output.replace(pattern, "");
+    if (output !== before) payloadsRemoved += 1;
+  }
+
+  output = output.replace(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi, (full, attrs, body) => {
+    const haystack = `${attrs}\n${body}`.toLowerCase();
+    const widgetRuntime = /(carousel|slideshow|slider|swiper|slick|owlcarousel|flexslider|dmwidgetgallery|widget.*gallery|gallery.*widget)/i.test(haystack);
+    const preserve = /(application\/ld\+json|type=["']application\/json|static-migrator)/i.test(attrs);
+    if (widgetRuntime && !preserve) {
+      scriptsRemoved += 1;
+      return "";
+    }
+    return full;
+  });
+
+  const safeguard = `
+<style id="static-migrator-hero-freeze-v164">
+/* Preserve the already-rendered static hero/slider state. */
+[class*="hero" i],
+[class*="banner" i],
+[class*="carousel" i],
+[class*="slider" i],
+[class*="slideshow" i] {
+  visibility: visible !important;
+}
+[class*="hero" i] [aria-hidden="false"],
+[class*="banner" i] [aria-hidden="false"],
+[class*="carousel" i] .active,
+[class*="slider" i] .active,
+[class*="slideshow" i] .active,
+[class*="carousel" i] .current,
+[class*="slider" i] .current,
+[class*="slideshow" i] .current {
   opacity: 1 !important;
   visibility: visible !important;
   transform: none !important;
-  animation: none !important;
-  transition: none !important;
-  z-index: 20 !important;
 }
-</style>
-<script id="static-migrator-overlay-v163-script">
-(function () {
-  var containerSelector = [
-    '[class*="hero" i]','[class*="banner" i]','[class*="carousel" i]',
-    '[class*="slider" i]','[class*="slideshow" i]',
-    '[data-widget-type*="slider" i]','[data-widget-type*="gallery" i]',
-    '[data-element-type*="slider" i]','[data-element-type*="gallery" i]'
-  ].join(',');
+</style>`;
 
-  var overlaySelector = [
-    'h1','h2','h3','h4','h5','h6','p','a','button',
-    '.dmButton','.dmNewParagraph','.caption','.overlay',
-    '[class*="caption" i]','[class*="overlay" i]','[class*="title" i]',
-    '[class*="subtitle" i]','[class*="button" i]'
-  ].join(',');
-
-  function textIsPlaceholder(el) {
-    var text = (el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
-    return text === 'slide title' || text === 'slide description' || text === 'button text' || text === 'title';
+  let safeguardInjected = false;
+  if (!output.includes("static-migrator-hero-freeze-v164")) {
+    output = /<\/head>/i.test(output)
+      ? output.replace(/<\/head>/i, `${safeguard}\n</head>`)
+      : `${safeguard}\n${output}`;
+    safeguardInjected = true;
   }
 
-  function intentionallyHidden(el) {
-    if (!el || el.nodeType !== 1) return true;
-    if (el.hidden || el.getAttribute('aria-hidden') === 'true') return true;
-    var cls = String(el.className || '').toLowerCase();
-    if (/\b(hidden|hide|is-hidden|dmhide|display-none)\b/.test(cls)) return true;
-    var inline = String(el.getAttribute('style') || '').toLowerCase();
-    if (/display\s*:\s*none/.test(inline)) return true;
-    return false;
-  }
-
-  function isActiveSlide(el) {
-    if (!el || intentionallyHidden(el)) return false;
-    return el.classList.contains('active') ||
-      el.classList.contains('current') ||
-      el.getAttribute('aria-hidden') === 'false' ||
-      el.getAttribute('aria-current') === 'true' ||
-      el.getAttribute('data-active') === 'true';
-  }
-
-  function findActiveScope(container) {
-    var slides = Array.from(container.querySelectorAll('[class*="slide" i], [class*="item" i], [role="tabpanel"]'));
-    return slides.find(isActiveSlide) || null;
-  }
-
-  function restore(el) {
-    if (intentionallyHidden(el) || textIsPlaceholder(el)) return;
-    var computed = window.getComputedStyle(el);
-    if (computed.display === 'none') return;
-    el.setAttribute('data-static-migrator-safe-overlay', 'true');
-    el.style.setProperty('opacity', '1', 'important');
-    el.style.setProperty('visibility', 'visible', 'important');
-    el.style.setProperty('transform', 'none', 'important');
-    el.style.setProperty('animation', 'none', 'important');
-    el.style.setProperty('transition', 'none', 'important');
-    el.style.setProperty('z-index', '20', 'important');
-  }
-
-  function runOnce() {
-    if (document.documentElement.dataset.staticMigratorOverlayDone === 'true') return;
-    document.documentElement.dataset.staticMigratorOverlayDone = 'true';
-    document.documentElement.classList.add('static-migrator-safe-overlays');
-
-    document.querySelectorAll(containerSelector).forEach(function (container) {
-      if (intentionallyHidden(container)) return;
-      var scope = findActiveScope(container) || container;
-      scope.querySelectorAll(overlaySelector).forEach(restore);
-
-      Array.from(container.children).forEach(function (child) {
-        if (child.matches && child.matches(overlaySelector)) restore(child);
-      });
-    });
-  }
-
-  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', runOnce, { once: true });
-  else runOnce();
-})();
-</script>`;
-
-  return /<\/body>/i.test(html)
-    ? html.replace(/<\/body>/i, `${payload}\n</body>`)
-    : `${html}\n${payload}`;
+  return { html: output, scriptsRemoved, payloadsRemoved, safeguardInjected };
 }
 
 async function servePreview(jobId, requestedPath, env) {
