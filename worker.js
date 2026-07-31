@@ -1,4 +1,4 @@
-const VERSION = "1.1.0";
+const VERSION = "1.1.1";
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -73,7 +73,6 @@ async function createMigration(request, env) {
 
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
-  const outputPrefix = `migrations/${id}`;
 
   await env.DB.batch([
     env.DB.prepare(`
@@ -84,8 +83,20 @@ async function createMigration(request, env) {
         output_prefix, created_at, updated_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).bind(
-      id, sourceUrl.href, sourceUrl.hostname, "queued", "created",
-      0, 0, 0, 0, 0, 0, outputPrefix, now, now
+      id,
+      sourceUrl.href,
+      sourceUrl.hostname,
+      "queued",
+      "created",
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      `migrations/${id}`,
+      now,
+      now
     ),
     eventStatement(env, id, "info", "created", "Migration job created.", { sourceUrl: sourceUrl.href }, now),
   ]);
@@ -107,16 +118,16 @@ async function getMigration(id, env) {
   const job = await getJob(id, env);
   if (!job) return json({ success: false, error: "Migration job not found." }, 404);
 
-  const [pages, events] = await Promise.all([
-    env.DB.prepare(`SELECT * FROM migration_pages WHERE job_id = ? ORDER BY source_url`).bind(id).all(),
+  const [pagesResult, eventsResult] = await Promise.all([
+    env.DB.prepare(`SELECT * FROM migration_pages WHERE job_id = ? ORDER BY source_url, created_at`).bind(id).all(),
     env.DB.prepare(`SELECT * FROM migration_events WHERE job_id = ? ORDER BY created_at, id`).bind(id).all(),
   ]);
 
   return json({
     success: true,
     job,
-    pages: pages.results || [],
-    events: (events.results || []).map((event) => ({
+    pages: pagesResult.results || [],
+    events: (eventsResult.results || []).map((event) => ({
       ...event,
       details: parseJson(event.details_json),
       details_json: undefined,
@@ -128,7 +139,10 @@ async function processMigration(id, env) {
   const job = await getJob(id, env);
   if (!job) return json({ success: false, error: "Migration job not found." }, 404);
 
-  const existing = await env.DB.prepare(`SELECT COUNT(*) AS count FROM migration_pages WHERE job_id = ?`).bind(id).first();
+  const existing = await env.DB.prepare(
+    `SELECT COUNT(*) AS count FROM migration_pages WHERE job_id = ?`
+  ).bind(id).first();
+
   if (Number(existing?.count || 0) > 0) {
     return json({
       success: false,
@@ -164,19 +178,26 @@ async function processMigration(id, env) {
           created_at, updated_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).bind(
-        crypto.randomUUID(), id, pageUrl,
+        crypto.randomUUID(),
+        id,
+        pageUrl,
         isHomepage ? result.meta?.url || job.source_url : null,
         outputPath(pageUrl),
         isHomepage ? result.meta?.title || null : null,
         isHomepage ? Number(result.meta?.status || 200) : null,
         isHomepage ? "captured" : "discovered",
         isHomepage ? homepageKey : null,
-        null, now, now
+        null,
+        now,
+        now
       );
     });
 
     statements.push(eventStatement(
-      env, id, "info", "discovery_complete",
+      env,
+      id,
+      "info",
+      "discovery_complete",
       "Homepage captured and internal pages discovered.",
       { discoveredPages: pages.length, capturedPages: 1, htmlLength: result.html.length, homepageKey },
       now
@@ -211,19 +232,22 @@ async function capturePages(id, env) {
   const job = await getJob(id, env);
   if (!job) return json({ success: false, error: "Migration job not found." }, 404);
 
-  const pending = await env.DB.prepare(`
+  const removedDuplicates = await removeDuplicatePages(id, env);
+
+  const pendingResult = await env.DB.prepare(`
     SELECT * FROM migration_pages
     WHERE job_id = ? AND status IN ('discovered', 'failed')
-    ORDER BY source_url
+    ORDER BY source_url, created_at
   `).bind(id).all();
 
-  const pages = pending.results || [];
+  const pages = pendingResult.results || [];
   if (!pages.length) {
     const totals = await pageTotals(id, env);
     return json({
       success: true,
       jobId: id,
       message: "There are no remaining pages to capture.",
+      removedDuplicatePages: removedDuplicates,
       totalPages: totals.total,
       capturedPages: totals.captured,
       failedPages: totals.failed,
@@ -237,24 +261,42 @@ async function capturePages(id, env) {
       SET status = ?, current_stage = ?, progress_percent = ?, updated_at = ?
       WHERE id = ?
     `).bind("processing", "capturing_pages", 30, startedAt, id),
-    eventStatement(env, id, "info", "capturing_pages", "Capture of remaining pages started.", { pendingPages: pages.length }, startedAt),
+    eventStatement(
+      env,
+      id,
+      "info",
+      "capturing_pages",
+      "Capture of remaining pages started.",
+      { pendingPages: pages.length, removedDuplicatePages: removedDuplicates },
+      startedAt
+    ),
   ]);
 
   const captured = [];
   const failed = [];
 
-  for (const page of pages) {
-    const pageStartedAt = new Date().toISOString();
+  for (let index = 0; index < pages.length; index++) {
+    const page = pages[index];
+
+    if (index > 0) {
+      await sleep(5000);
+    }
+
     await env.DB.prepare(`
       UPDATE migration_pages
       SET status = ?, error_message = NULL, updated_at = ?
       WHERE id = ?
-    `).bind("capturing", pageStartedAt, page.id).run();
+    `).bind("capturing", new Date().toISOString(), page.id).run();
 
     try {
       const result = await renderedHtml(env, page.source_url);
       const key = `${job.output_prefix}/pages/${page.output_path || "index.html"}`;
-      await putHtml(env, key, result.html, { jobId: id, pageId: page.id, sourceUrl: page.source_url });
+
+      await putHtml(env, key, result.html, {
+        jobId: id,
+        pageId: page.id,
+        sourceUrl: page.source_url,
+      });
 
       const now = new Date().toISOString();
       await env.DB.prepare(`
@@ -266,7 +308,10 @@ async function capturePages(id, env) {
         result.meta?.url || page.source_url,
         result.meta?.title || null,
         Number(result.meta?.status || 200),
-        "captured", key, now, page.id
+        "captured",
+        key,
+        now,
+        page.id
       ).run();
 
       captured.push({
@@ -284,7 +329,12 @@ async function capturePages(id, env) {
         SET status = ?, error_message = ?, updated_at = ?
         WHERE id = ?
       `).bind("failed", message, new Date().toISOString(), page.id).run();
-      failed.push({ pageId: page.id, sourceUrl: page.source_url, error: message });
+
+      failed.push({
+        pageId: page.id,
+        sourceUrl: page.source_url,
+        error: message,
+      });
     }
   }
 
@@ -298,14 +348,34 @@ async function capturePages(id, env) {
   await env.DB.batch([
     env.DB.prepare(`
       UPDATE migration_jobs
-      SET status = ?, current_stage = ?, progress_percent = ?, captured_pages = ?,
+      SET status = ?, current_stage = ?, progress_percent = ?,
+          discovered_pages = ?, captured_pages = ?,
           error_count = error_count + ?, updated_at = ?
       WHERE id = ?
-    `).bind(status, stage, progress, totals.captured, failed.length, now, id),
+    `).bind(
+      status,
+      stage,
+      progress,
+      totals.total,
+      totals.captured,
+      failed.length,
+      now,
+      id
+    ),
     eventStatement(
-      env, id, failed.length ? "warning" : "info", stage,
-      failed.length ? "Page capture completed with errors." : "All discovered pages were captured.",
-      { totalPages: totals.total, capturedPages: totals.captured, failedPages: totals.failed },
+      env,
+      id,
+      failed.length ? "warning" : "info",
+      stage,
+      failed.length
+        ? "Page capture completed with errors. The endpoint can be run again to retry failed pages."
+        : "All discovered pages were captured.",
+      {
+        totalPages: totals.total,
+        capturedPages: totals.captured,
+        failedPages: totals.failed,
+        removedDuplicatePages: removedDuplicates,
+      },
       now
     ),
   ]);
@@ -316,6 +386,7 @@ async function capturePages(id, env) {
     status,
     currentStage: stage,
     progressPercent: progress,
+    removedDuplicatePages: removedDuplicates,
     totalPages: totals.total,
     capturedPages: totals.captured,
     failedPages: totals.failed,
@@ -324,19 +395,63 @@ async function capturePages(id, env) {
   });
 }
 
+async function removeDuplicatePages(jobId, env) {
+  const result = await env.DB.prepare(`
+    SELECT * FROM migration_pages
+    WHERE job_id = ?
+    ORDER BY source_url, created_at, id
+  `).bind(jobId).all();
+
+  const rows = result.results || [];
+  const groups = new Map();
+
+  for (const row of rows) {
+    const key = comparableUrl(row.source_url);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(row);
+  }
+
+  const duplicateIds = [];
+
+  for (const group of groups.values()) {
+    if (group.length < 2) continue;
+
+    const keeper =
+      group.find((row) => row.status === "captured") ||
+      group[0];
+
+    for (const row of group) {
+      if (row.id !== keeper.id) duplicateIds.push(row.id);
+    }
+  }
+
+  if (!duplicateIds.length) return 0;
+
+  const statements = duplicateIds.map((pageId) =>
+    env.DB.prepare(`DELETE FROM migration_pages WHERE id = ? AND job_id = ?`).bind(pageId, jobId)
+  );
+
+  await env.DB.batch(statements);
+  return duplicateIds.length;
+}
+
 async function renderedHtml(env, url) {
   let lastError;
 
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  for (let attempt = 1; attempt <= 5; attempt++) {
     try {
       const response = await env.BROWSER.quickAction("content", {
         url,
         userAgent: USER_AGENT,
-        gotoOptions: { waitUntil: "networkidle2", timeout: 45000 },
+        gotoOptions: {
+          waitUntil: "networkidle2",
+          timeout: 45000,
+        },
       });
 
       const text = await response.text();
       let result;
+
       try {
         result = JSON.parse(text);
       } catch {
@@ -344,16 +459,31 @@ async function renderedHtml(env, url) {
       }
 
       if (!result.success) {
-        throw new Error(result?.errors?.[0]?.message || result?.error || "Browser Run failed.");
+        throw new Error(
+          result?.errors?.[0]?.message ||
+          result?.error ||
+          "Browser Run failed."
+        );
       }
+
       if (typeof result.result !== "string" || result.result.length < 100) {
         throw new Error("Browser Run did not return usable rendered HTML.");
       }
 
-      return { html: result.result, meta: result.meta || {} };
+      return {
+        html: result.result,
+        meta: result.meta || {},
+      };
     } catch (error) {
       lastError = error;
-      if (attempt < 3) await sleep(attempt * 1500);
+
+      if (attempt < 5) {
+        const isRateLimit = /rate limit|429/i.test(errorMessage(error));
+        const waitMs = isRateLimit
+          ? 5000 * attempt
+          : 2000 * attempt;
+        await sleep(waitMs);
+      }
     }
   }
 
@@ -374,6 +504,7 @@ function discoverInternalPages(html, sourceUrl) {
       if (!["http:", "https:"].includes(url.protocol)) continue;
       if (normaliseHostname(url.hostname) !== normaliseHostname(sourceUrl.hostname)) continue;
       if (/\.(?:css|js|json|jpe?g|png|gif|webp|svg|ico|pdf|zip|mp3|mp4|woff2?|ttf|otf)$/i.test(url.pathname)) continue;
+
       url.hash = "";
       removeTracking(url);
       urls.add(comparableUrl(url.href));
@@ -408,7 +539,8 @@ async function pageTotals(id, env) {
       SUM(CASE WHEN status = 'captured' THEN 1 ELSE 0 END) AS captured,
       SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
       COUNT(*) AS total
-    FROM migration_pages WHERE job_id = ?
+    FROM migration_pages
+    WHERE job_id = ?
   `).bind(id).first();
 
   return {
@@ -424,7 +556,10 @@ function eventStatement(env, jobId, level, stage, message, details, createdAt) {
       (job_id, level, stage, message, details_json, created_at)
     VALUES (?, ?, ?, ?, ?, ?)
   `).bind(
-    jobId, level, stage, message,
+    jobId,
+    level,
+    stage,
+    message,
     details == null ? null : JSON.stringify(details),
     createdAt
   );
@@ -448,17 +583,24 @@ async function failStage(env, id, stage, error) {
 
 async function putHtml(env, key, html, metadata) {
   const result = await env.STORAGE.put(key, html, {
-    httpMetadata: { contentType: "text/html; charset=utf-8" },
+    httpMetadata: {
+      contentType: "text/html; charset=utf-8",
+    },
     customMetadata: metadata,
   });
-  if (result === null) throw new Error(`R2 did not store the object: ${key}`);
+
+  if (result === null) {
+    throw new Error(`R2 did not store the object: ${key}`);
+  }
 }
 
 function normaliseSourceUrl(value) {
   if (typeof value !== "string" || !value.trim()) return null;
+
   try {
     const url = new URL(value.trim());
     if (!["http:", "https:"].includes(url.protocol)) return null;
+
     url.hash = "";
     removeTracking(url);
     return url;
@@ -471,7 +613,11 @@ function comparableUrl(value) {
   const url = new URL(value);
   url.hash = "";
   removeTracking(url);
-  if (url.pathname !== "/") url.pathname = url.pathname.replace(/\/+$/, "");
+
+  if (url.pathname !== "/") {
+    url.pathname = url.pathname.replace(/\/+$/, "");
+  }
+
   return url.href;
 }
 
@@ -481,8 +627,14 @@ function normaliseHostname(value) {
 
 function removeTracking(url) {
   for (const key of [
-    "utm_source", "utm_medium", "utm_campaign", "utm_term",
-    "utm_content", "utm_id", "gclid", "fbclid",
+    "utm_source",
+    "utm_medium",
+    "utm_campaign",
+    "utm_term",
+    "utm_content",
+    "utm_id",
+    "gclid",
+    "fbclid",
   ]) {
     url.searchParams.delete(key);
   }
@@ -490,10 +642,12 @@ function removeTracking(url) {
 
 function hash(value) {
   let result = 2166136261;
-  for (let i = 0; i < value.length; i++) {
-    result ^= value.charCodeAt(i);
+
+  for (let index = 0; index < value.length; index++) {
+    result ^= value.charCodeAt(index);
     result = Math.imul(result, 16777619);
   }
+
   return (result >>> 0).toString(36);
 }
 
@@ -502,11 +656,15 @@ function validateBindings(env) {
   if (!env.BROWSER) missing.push("BROWSER");
   if (!env.DB) missing.push("DB");
   if (!env.STORAGE) missing.push("STORAGE");
-  if (missing.length) throw new Error(`Missing Cloudflare binding(s): ${missing.join(", ")}`);
+
+  if (missing.length) {
+    throw new Error(`Missing Cloudflare binding(s): ${missing.join(", ")}`);
+  }
 }
 
 function parseJson(value) {
   if (value == null || value === "") return null;
+
   try {
     return JSON.parse(value);
   } catch {
@@ -515,13 +673,18 @@ function parseJson(value) {
 }
 
 function errorMessage(error) {
-  return error instanceof Error ? error.message : String(error || "Unexpected server error.");
+  return error instanceof Error
+    ? error.message
+    : String(error || "Unexpected server error.");
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function sleep(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 function json(data, status = 200) {
-  return Response.json(data, { status, headers: CORS_HEADERS });
+  return Response.json(data, {
+    status,
+    headers: CORS_HEADERS,
+  });
 }
