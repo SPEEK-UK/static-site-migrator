@@ -1,4 +1,4 @@
-const VERSION = "1.6.6";
+const VERSION = "1.6.7";
 const CORS = {"Access-Control-Allow-Origin":"*","Access-Control-Allow-Methods":"GET, POST, OPTIONS","Access-Control-Allow-Headers":"Content-Type"};
 
 export default {
@@ -15,9 +15,9 @@ export default {
         return servePreview(decodeURIComponent(preview[1]),preview[2]||"/",env);
       }
 
-      const fix = path.match(/^\/api\/migrations\/([^/]+)\/fix-animations-only$/);
+      const fix = path.match(/^\/api\/migrations\/([^/]+)\/fix-duda-animations$/);
       if (request.method === "POST" && fix) {
-        return fixAnimationsOnly(decodeURIComponent(fix[1]),env);
+        return fixDudaAnimations(decodeURIComponent(fix[1]),env);
       }
 
       return json({success:false,error:"Route not found."},404);
@@ -27,7 +27,7 @@ export default {
   }
 };
 
-async function fixAnimationsOnly(jobId,env) {
+async function fixDudaAnimations(jobId,env) {
   const job = await env.DB.prepare("SELECT * FROM migration_jobs WHERE id=?").bind(jobId).first();
   if (!job) return json({success:false,error:"Migration job not found."},404);
 
@@ -49,7 +49,7 @@ async function fixAnimationsOnly(jobId,env) {
       html=injectAnimationPayload(html);
       await env.STORAGE.put(key,html,{
         httpMetadata:{contentType:"text/html; charset=utf-8"},
-        customMetadata:{jobId,pageId:page.id,sourceUrl:page.source_url,version:VERSION,animationFinalState:"true"}
+        customMetadata:{jobId,pageId:page.id,sourceUrl:page.source_url,version:VERSION,dudaAnimationFinalState:"true"}
       });
       processed.push({pageId:page.id,sourceUrl:page.source_url,outputPath,r2Key:key,htmlLength:html.length});
     } catch (error) {
@@ -58,7 +58,7 @@ async function fixAnimationsOnly(jobId,env) {
   }
 
   const success=warnings.length===0;
-  const stage=success?"animations_finalised":"animations_finalised_with_warnings";
+  const stage=success?"duda_animations_finalised":"duda_animations_finalised_with_warnings";
   await env.DB.prepare("UPDATE migration_jobs SET current_stage=?,progress_percent=?,updated_at=? WHERE id=?")
     .bind(stage,success?99:98,new Date().toISOString(),jobId).run();
 
@@ -68,13 +68,14 @@ async function fixAnimationsOnly(jobId,env) {
 function removeAnimationPayload(html) {
   return html
     .replace(/<style\b[^>]*id=["']static-migrator-animation-final-v166["'][^>]*>[\s\S]*?<\/style>/gi,"")
-    .replace(/<script\b[^>]*id=["']static-migrator-animation-final-v166-script["'][^>]*>[\s\S]*?<\/script>/gi,"");
+    .replace(/<script\b[^>]*id=["']static-migrator-animation-final-v166-script["'][^>]*>[\s\S]*?<\/script>/gi,"")
+    .replace(/<style\b[^>]*id=["']static-migrator-animation-final-v167["'][^>]*>[\s\S]*?<\/style>/gi,"")
+    .replace(/<script\b[^>]*id=["']static-migrator-animation-final-v167-script["'][^>]*>[\s\S]*?<\/script>/gi,"");
 }
 
 function injectAnimationPayload(html) {
   const payload=`
-<style id="static-migrator-animation-final-v166">
-/* Animation-final-state correction only. Hero, carousel and slider widgets are excluded. */
+<style id="static-migrator-animation-final-v167">
 [data-static-migrator-animation-fixed="true"] {
   opacity:1!important;
   visibility:visible!important;
@@ -84,7 +85,7 @@ function injectAnimationPayload(html) {
   transition:none!important;
 }
 </style>
-<script id="static-migrator-animation-final-v166-script">
+<script id="static-migrator-animation-final-v167-script">
 (function(){
   function insideWidget(el){
     return !!el.closest('[class*="hero" i],[class*="banner" i],[class*="carousel" i],[class*="slider" i],[class*="slideshow" i],[data-widget-type*="slider" i],[data-widget-type*="gallery" i]');
@@ -98,14 +99,8 @@ function injectAnimationPayload(html) {
     return /display\\s*:\\s*none|visibility\\s*:\\s*hidden/.test(inline);
   }
 
-  function looksAnimated(el){
-    if(el.matches('[data-anim-desktop],[data-animation],.dmAnimation,.skrollable,.skrollable-before,.skrollable-after,.wow,.animated')) return true;
-    var inline=String(el.getAttribute('style')||'').toLowerCase();
-    return /transform\\s*:|translate[xyz]?\\s*\\(|opacity\\s*:\\s*0(?:\\D|$)/.test(inline);
-  }
-
   function fix(el){
-    if(!el || insideWidget(el) || explicitlyHidden(el) || !looksAnimated(el)) return;
+    if(!el || insideWidget(el) || explicitlyHidden(el)) return;
     el.setAttribute('data-static-migrator-animation-fixed','true');
     el.style.setProperty('opacity','1','important');
     el.style.setProperty('visibility','visible','important');
@@ -116,7 +111,7 @@ function injectAnimationPayload(html) {
   }
 
   function run(){
-    document.querySelectorAll('[data-anim-desktop],[data-animation],.dmAnimation,.skrollable,.skrollable-before,.skrollable-after,.wow,.animated,[style*="transform" i],[style*="translate" i],[style*="opacity: 0" i],[style*="opacity:0" i]').forEach(fix);
+    document.querySelectorAll('[data-anim-extended]').forEach(fix);
   }
 
   if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',run,{once:true});
