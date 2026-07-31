@@ -1,4 +1,4 @@
-const VERSION = "1.4.0";
+const VERSION = "1.5.0";
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -27,6 +27,15 @@ export default {
         });
       }
 
+      const previewMatch = url.pathname.match(/^\/preview\/([^/]+)(\/.*)?$/);
+      if (request.method === "GET" && previewMatch) {
+        return await servePreview(
+          decodeURIComponent(previewMatch[1]),
+          previewMatch[2] || "/",
+          env
+        );
+      }
+
       let match = pathname.match(/^\/api\/migrations\/([^/]+)\/rewrite-pages$/);
       if (request.method === "POST" && match) {
         return await rewritePages(decodeURIComponent(match[1]), env);
@@ -44,6 +53,113 @@ export default {
     }
   },
 };
+
+async function servePreview(jobId, requestedPath, env) {
+  const job = await env.DB
+    .prepare("SELECT * FROM migration_jobs WHERE id = ?")
+    .bind(jobId)
+    .first();
+
+  if (!job) {
+    return new Response("Preview job not found.", { status: 404 });
+  }
+
+  let relativePath;
+  try {
+    relativePath = decodeURIComponent(requestedPath || "/");
+  } catch {
+    return new Response("Invalid preview path.", { status: 400 });
+  }
+
+  relativePath = relativePath.replace(/^\/+/, "");
+  if (!relativePath) relativePath = "index.html";
+  if (relativePath.endsWith("/")) relativePath += "index.html";
+
+  if (relativePath.includes("..") || relativePath.includes("\\")) {
+    return new Response("Invalid preview path.", { status: 400 });
+  }
+
+  const candidates = [relativePath];
+  if (!hasFileExtension(relativePath)) {
+    candidates.push(`${relativePath}/index.html`);
+  }
+
+  let object = null;
+  let resolvedPath = null;
+
+  for (const candidate of candidates) {
+    const key = `${job.output_prefix}/site/${candidate}`;
+    object = await env.STORAGE.get(key);
+    if (object && object.body) {
+      resolvedPath = candidate;
+      break;
+    }
+  }
+
+  if (!object || !object.body || !resolvedPath) {
+    return new Response("Preview file not found.", { status: 404 });
+  }
+
+  const contentType =
+    object.httpMetadata?.contentType || guessContentType(resolvedPath);
+
+  const headers = new Headers({
+    "Content-Type": contentType,
+    "Cache-Control": "no-store, max-age=0",
+    "X-Robots-Tag": "noindex, nofollow",
+  });
+
+  const previewPrefix = `/preview/${encodeURIComponent(jobId)}`;
+
+  if (/text\/html/i.test(contentType)) {
+    let html = await object.text();
+    html = prefixPreviewHtmlUrls(html, previewPrefix);
+    return new Response(html, { status: 200, headers });
+  }
+
+  if (/text\/css/i.test(contentType)) {
+    let css = await object.text();
+    css = prefixPreviewCssUrls(css, previewPrefix);
+    return new Response(css, { status: 200, headers });
+  }
+
+  return new Response(object.body, { status: 200, headers });
+}
+
+function prefixPreviewHtmlUrls(html, prefix) {
+  let output = html.replace(
+    /\b(href|src|poster|data-src|data-image-url)\s*=\s*(["'])\/(?!\/|preview\/)(.*?)\2/gi,
+    (_, attribute, quote, value) =>
+      `${attribute}=${quote}${prefix}/${value}${quote}`
+  );
+
+  output = output.replace(
+    /\bsrcset\s*=\s*(["'])(.*?)\1/gi,
+    (match, quote, value) => {
+      const rewritten = value
+        .split(",")
+        .map((candidate) => {
+          const parts = candidate.trim().split(/\s+/);
+          if (parts[0]?.startsWith("/") && !parts[0].startsWith("//") && !parts[0].startsWith("/preview/")) {
+            parts[0] = `${prefix}${parts[0]}`;
+          }
+          return parts.join(" ");
+        })
+        .join(", ");
+      return `srcset=${quote}${rewritten}${quote}`;
+    }
+  );
+
+  output = prefixPreviewCssUrls(output, prefix);
+  return output;
+}
+
+function prefixPreviewCssUrls(value, prefix) {
+  return value.replace(
+    /url\(\s*(["']?)\/(?!\/|preview\/)(.*?)\1\s*\)/gi,
+    (_, quote, path) => `url(${quote}${prefix}/${path}${quote})`
+  );
+}
 
 async function getMigration(jobId, env) {
   const job = await env.DB
@@ -96,19 +212,15 @@ async function rewritePages(jobId, env) {
   const [pagesResult, assetsResult] = await Promise.all([
     env.DB
       .prepare(`
-        SELECT *
-        FROM migration_pages
-        WHERE job_id = ?
-          AND status = 'captured'
-          AND html_r2_key IS NOT NULL
+        SELECT * FROM migration_pages
+        WHERE job_id = ? AND status = 'captured' AND html_r2_key IS NOT NULL
         ORDER BY source_url
       `)
       .bind(jobId)
       .all(),
     env.DB
       .prepare(`
-        SELECT *
-        FROM migration_assets
+        SELECT * FROM migration_assets
         WHERE job_id = ?
         ORDER BY source_url
       `)
@@ -135,11 +247,13 @@ async function rewritePages(jobId, env) {
 
   const pageMap = new Map();
   for (const page of pages) {
-    pageMap.set(normaliseComparableUrl(page.source_url), outputPathToPublicUrl(page.output_path));
+    pageMap.set(
+      normaliseComparableUrl(page.source_url),
+      outputPathToPublicUrl(page.output_path)
+    );
   }
 
   const startedAt = now();
-
   await env.DB.batch([
     env.DB
       .prepare(`
@@ -213,19 +327,11 @@ async function rewritePages(jobId, env) {
       }
 
       const originalHtml = await capturedObject.text();
-      const result = rewriteHtml(
-        originalHtml,
-        page.source_url,
-        assetMap,
-        pageMap
-      );
-
+      const result = rewriteHtml(originalHtml, page.source_url, assetMap, pageMap);
       const finalKey = `${job.output_prefix}/site/${page.output_path || "index.html"}`;
 
       await env.STORAGE.put(finalKey, result.html, {
-        httpMetadata: {
-          contentType: "text/html; charset=utf-8",
-        },
+        httpMetadata: { contentType: "text/html; charset=utf-8" },
         customMetadata: {
           jobId,
           pageId: page.id,
@@ -272,17 +378,12 @@ async function rewritePages(jobId, env) {
       assetType: asset.asset_type,
       reason: asset.error_message,
     })),
-    warnings: {
-      css: cssWarnings,
-      pages: pageWarnings,
-    },
+    warnings: { css: cssWarnings, pages: pageWarnings },
   };
 
   const manifestKey = `${job.output_prefix}/site/migration-manifest.json`;
   await env.STORAGE.put(manifestKey, JSON.stringify(manifest, null, 2), {
-    httpMetadata: {
-      contentType: "application/json; charset=utf-8",
-    },
+    httpMetadata: { contentType: "application/json; charset=utf-8" },
     customMetadata: {
       jobId,
       generatedBy: `static-site-migrator-${VERSION}`,
@@ -529,6 +630,40 @@ function eventStatement(env, jobId, level, stage, message, details, createdAt) {
       details == null ? null : JSON.stringify(details),
       createdAt
     );
+}
+
+function hasFileExtension(path) {
+  return /\.[a-zA-Z0-9]{1,10}$/.test(path.split("?")[0]);
+}
+
+function guessContentType(path) {
+  const lower = path.toLowerCase();
+  const types = [
+    [".html", "text/html; charset=utf-8"],
+    [".css", "text/css; charset=utf-8"],
+    [".js", "application/javascript; charset=utf-8"],
+    [".json", "application/json; charset=utf-8"],
+    [".png", "image/png"],
+    [".jpg", "image/jpeg"],
+    [".jpeg", "image/jpeg"],
+    [".gif", "image/gif"],
+    [".webp", "image/webp"],
+    [".svg", "image/svg+xml"],
+    [".ico", "image/x-icon"],
+    [".woff2", "font/woff2"],
+    [".woff", "font/woff"],
+    [".ttf", "font/ttf"],
+    [".otf", "font/otf"],
+    [".mp4", "video/mp4"],
+    [".webm", "video/webm"],
+    [".mp3", "audio/mpeg"],
+  ];
+
+  for (const [extension, type] of types) {
+    if (lower.endsWith(extension)) return type;
+  }
+
+  return "application/octet-stream";
 }
 
 function validateBindings(env) {
