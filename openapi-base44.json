@@ -1,0 +1,84 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Static Site Migrator Worker",
+    "version": "1.0.0",
+    "description": "Base44 integration for the Cloudflare Worker backend."
+  },
+  "servers": [
+    {
+      "url": "https://static-site-migrator-engine.speekukltd.workers.dev"
+    }
+  ],
+  "paths": {
+    "/": {
+      "get": {
+        "operationId": "getWorkerHealth",
+        "summary": "Check Worker health",
+        "responses": {
+          "200": {
+            "description": "Worker is online",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean" },
+                    "version": { "type": "string" },
+                    "status": { "type": "string" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/migrations/{jobId}/apply-overrides": {
+      "post": {
+        "operationId": "applyMigrationOverrides",
+        "summary": "Apply manual review overrides to a migration",
+        "parameters": [
+          {
+            "name": "jobId",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["overrides"],
+                "properties": {
+                  "overrides": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "required": ["page", "widgetId", "action"],
+                      "properties": {
+                        "page": { "type": "string" },
+                        "widgetId": { "type": "string" },
+                        "action": { "type": "string", "enum": ["hide"] },
+                        "scope": { "type": "string", "enum": ["widget", "row"], "default": "widget" },
+                        "note": { "type": "string" }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Overrides applied"
+          }
+        }
+      }
+    }
+  }
+}
