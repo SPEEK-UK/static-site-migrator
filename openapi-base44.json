@@ -2,8 +2,8 @@
   "openapi": "3.0.3",
   "info": {
     "title": "Static Site Migrator Worker",
-    "version": "1.0.0",
-    "description": "Base44 integration for the Cloudflare Worker backend."
+    "version": "1.8.0",
+    "description": "Base44 integration for creating, monitoring, previewing and reviewing static-site migrations."
   },
   "servers": [
     {
@@ -24,12 +24,70 @@
                   "type": "object",
                   "properties": {
                     "success": { "type": "boolean" },
+                    "service": { "type": "string" },
                     "version": { "type": "string" },
                     "status": { "type": "string" }
                   }
                 }
               }
             }
+          }
+        }
+      }
+    },
+    "/api/migrations": {
+      "post": {
+        "operationId": "createMigration",
+        "summary": "Create a migration job",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["sourceUrl"],
+                "properties": {
+                  "sourceUrl": { "type": "string", "format": "uri" },
+                  "projectName": { "type": "string" },
+                  "crawlDepth": { "type": "integer", "minimum": 1, "default": 3 },
+                  "maxPages": { "type": "integer", "minimum": 1, "default": 50 },
+                  "preserveSliders": { "type": "boolean", "default": true },
+                  "flattenAnimations": { "type": "boolean", "default": true },
+                  "formEndpoint": { "type": "string", "nullable": true },
+                  "base44JobId": { "type": "string", "nullable": true }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Migration job created"
+          },
+          "400": {
+            "description": "Invalid request"
+          }
+        }
+      }
+    },
+    "/api/migrations/{jobId}": {
+      "get": {
+        "operationId": "getMigrationStatus",
+        "summary": "Get migration status and results",
+        "parameters": [
+          {
+            "name": "jobId",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Migration job status"
+          },
+          "404": {
+            "description": "Migration job not found"
           }
         }
       }
@@ -76,6 +134,25 @@
         "responses": {
           "200": {
             "description": "Overrides applied"
+          }
+        }
+      }
+    },
+    "/api/migrations/{jobId}/overrides": {
+      "get": {
+        "operationId": "getMigrationOverrides",
+        "summary": "Get manual overrides for a migration",
+        "parameters": [
+          {
+            "name": "jobId",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Manual overrides"
           }
         }
       }
